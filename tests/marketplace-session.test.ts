@@ -1411,3 +1411,383 @@ describe('marketplace session opened listings (#5)', () => {
     expect(result.unpainted).toEqual([]);
   });
 });
+
+describe('marketplace session rescore (#6)', () => {
+  const tile = (id: string, name: string, description?: string) => ({
+    href: `https://www.facebook.com/marketplace/item/${id}/`,
+    name,
+    ...(description === undefined ? {} : { description }),
+  });
+
+  it('judges cached survivors again even when a stored judgment exists', async () => {
+    let calls = 0;
+    const gateway = new ScriptedGateway((request) => {
+      calls += 1;
+      const rescoring = calls > 1;
+      return answersFor({
+        '801': rescoring
+          ? { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 }
+          : { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 },
+        '802': rescoring
+          ? { fit: 0.4, confidence: 0.9, dealbreaker: 0.1 }
+          : { fit: 2.7, confidence: 0.9, dealbreaker: 0.0 },
+      })(request);
+    });
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone 13' };
+    const snapshots = [
+      tile('801', 'iPhone 13 128GB, Palermo'),
+      tile('802', 'iPhone 13 mini, Palermo'),
+    ];
+
+    const first = await session.judgeWave(brief, snapshots, true);
+    expect(gateway.requests).toHaveLength(1);
+    expect(first.badges).toEqual([
+      { id: '801', text: 'MATCH 2.6', tone: 'match' },
+      { id: '802', text: 'MATCH 2.7', tone: 'match' },
+    ]);
+
+    // A plain wave would repaint from the cache; rescore asks again and the
+    // new verdicts replace the badges and the panel entries.
+    const rescored = await session.rescore(brief, snapshots, true);
+    expect(gateway.requests).toHaveLength(2);
+    const request = gateway.requests[1]!;
+    expect(request.model).toBe('jev-1.13');
+    expect(request.state.listings.map((listing) => listing.id)).toEqual(['801', '802']);
+    expect(request.questions).toHaveLength(4);
+    expect(rescored.badges).toEqual([
+      { id: '801', text: 'REVIEW 1.5', tone: 'review' },
+      { id: '802', text: 'SKIP 0.4', tone: 'skip' },
+    ]);
+    expect(rescored.unpainted).toEqual([]);
+    expect(rescored.panel.entries).toEqual([
+      { id: '801', title: 'iPhone 13 128GB', verdict: 'REVIEW', fit: 1.5, reason: null },
+      { id: '802', title: 'iPhone 13 mini', verdict: 'SKIP', fit: 0.4, reason: null },
+    ]);
+    expect(rescored.panel.error).toBeNull();
+  });
+
+  it('sends an open survivor on rescore as its own request with the description', async () => {
+    const gateway = new ScriptedGateway((request) => {
+      const listing = request.state.listings[0]!;
+      const described = (listing as { description?: unknown }).description !== undefined;
+      const scripted = described
+        ? { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 }
+        : { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 };
+      const answers: Record<string, AnswerValue> = {};
+      for (const question of request.questions) {
+        answers[question.name] =
+          question.kind === 'score'
+            ? { kind: 'score', value: scripted.fit, confidence: scripted.confidence }
+            : { kind: 'noul', probabilityTrue: scripted.dealbreaker };
+      }
+      return described
+        ? { ok: true, answers, ms: 210, cost: 0.002 }
+        : { ok: true, answers, ms: 120, cost: 0.001 };
+    });
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone 13' };
+    const name = 'iPhone 13 128GB, Palermo';
+    const description = 'Cracked back glass, battery at 78%.';
+
+    const grid = await session.judgeWave(brief, [tile('811', name)], true);
+    expect(gateway.requests).toHaveLength(1);
+    expect(grid.badges).toEqual([{ id: '811', text: 'MATCH 2.6', tone: 'match' }]);
+
+    const rescored = await session.rescore(brief, [tile('811', name, description)], true);
+    expect(gateway.requests).toHaveLength(2);
+    const request = gateway.requests[1]!;
+    expect(request.model).toBe('jev-1.13');
+    expect(request.state.listings).toEqual([
+      {
+        id: '811',
+        title: 'iPhone 13 128GB',
+        price: null,
+        currency: null,
+        place: 'Palermo',
+        description,
+      },
+    ]);
+    expect(request.questions).toHaveLength(2);
+    expect(request.questions.every((question) => question.name.includes('811'))).toBe(true);
+    expect(rescored.badges).toEqual([{ id: '811', text: 'REVIEW 1.5', tone: 'review' }]);
+    expect(rescored.unpainted).toEqual([]);
+    expect(rescored.panel.entries).toEqual([
+      { id: '811', title: 'iPhone 13 128GB', verdict: 'REVIEW', fit: 1.5, reason: null },
+    ]);
+    expect(rescored.panel.lastMs).toBe(210);
+    expect(rescored.panel.totalCost).toBeCloseTo(0.003, 6);
+  });
+
+  it('keeps opened survivors out of grid chunks on a mixed rescore', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({
+        '821': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 },
+        '822': { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 },
+      }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'lamp' };
+    await session.judgeWave(
+      brief,
+      [tile('821', 'Lamp 821, Palermo'), tile('822', 'Lamp 822, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+
+    const rescored = await session.rescore(
+      brief,
+      [
+        tile('821', 'Lamp 821, Palermo'),
+        tile('822', 'Lamp 822, Palermo', 'Small scratch on base.'),
+      ],
+      true,
+    );
+
+    expect(gateway.requests).toHaveLength(3);
+    const [gridChunk, openedSingle] = gateway.requests.slice(1) as [
+      DecisionRequest,
+      DecisionRequest,
+    ];
+    expect(gridChunk.state.listings.map((listing) => listing.id)).toEqual(['821']);
+    expect(gridChunk.questions).toHaveLength(2);
+    expect(openedSingle.state.listings).toEqual([
+      {
+        id: '822',
+        title: 'Lamp 822',
+        price: null,
+        currency: null,
+        place: 'Palermo',
+        description: 'Small scratch on base.',
+      },
+    ]);
+    expect(openedSingle.questions).toHaveLength(2);
+    expect(rescored.badges).toHaveLength(2);
+    expect(rescored.unpainted).toEqual([]);
+  });
+
+  it('cuts a rescore past 12 survivors into one request per chunk', async () => {
+    const ids = Array.from({ length: 13 }, (_, index) => `${830 + index}`);
+    const scripted: Record<string, ScriptedVerdict> = Object.fromEntries(
+      ids.map((id) => [id, { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 }]),
+    );
+    const gateway = new ScriptedGateway(answersFor(scripted));
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'lamp' };
+    const snapshots = ids.map((id) => tile(id, `Lamp ${id}, Palermo`));
+
+    await session.judgeWave(brief, snapshots, true);
+    expect(gateway.requests).toHaveLength(2);
+
+    const rescored = await session.rescore(brief, snapshots, true);
+    expect(gateway.requests).toHaveLength(4);
+    const [third, fourth] = gateway.requests.slice(2) as [DecisionRequest, DecisionRequest];
+    expect(third.model).toBe('jev-1.13');
+    expect(third.state.listings.map((listing) => listing.id)).toEqual(ids.slice(0, 12));
+    expect(third.questions).toHaveLength(24);
+    expect(fourth.state.listings.map((listing) => listing.id)).toEqual(ids.slice(12));
+    expect(fourth.questions).toHaveLength(2);
+    expect(rescored.badges).toHaveLength(13);
+    expect(rescored.unpainted).toEqual([]);
+    expect(rescored.panel.kept).toBe(13);
+    expect(rescored.panel.error).toBeNull();
+  });
+
+  it('keeps local SKIP tiles unsent on rescore with their reason', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '841': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone', maxPrice: 200000, currency: 'ARS' as const };
+    const snapshots = [
+      tile('841', 'iPhone 13 128GB, $ 150.000, Palermo'),
+      tile('842', 'iPhone 13 128GB, $ 250.000, Palermo'),
+    ];
+
+    const first = await session.judgeWave(brief, snapshots, true);
+    expect(gateway.requests).toHaveLength(1);
+    expect(first.badges).toEqual([
+      { id: '842', text: 'SKIP price', tone: 'skip' },
+      { id: '841', text: 'MATCH 2.6', tone: 'match' },
+    ]);
+
+    const rescored = await session.rescore(brief, snapshots, true);
+    expect(gateway.requests).toHaveLength(2);
+    const request = gateway.requests[1]!;
+    expect(request.state.listings.map((listing) => listing.id)).toEqual(['841']);
+    expect(request.questions).toHaveLength(2);
+    expect(request.questions.every((question) => !question.name.includes('842'))).toBe(true);
+    expect(rescored.badges).toEqual([
+      { id: '842', text: 'SKIP price', tone: 'skip' },
+      { id: '841', text: 'MATCH 2.6', tone: 'match' },
+    ]);
+    expect(rescored.unpainted).toEqual([]);
+    expect(rescored.panel.entries).toEqual([
+      { id: '841', title: 'iPhone 13 128GB', verdict: 'MATCH', fit: 2.6, reason: null },
+      { id: '842', title: 'iPhone 13 128GB', verdict: 'SKIP', fit: null, reason: 'price' },
+    ]);
+  });
+
+  it('leaves off-screen judgments in place on rescore', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({
+        '851': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 },
+        '852': { fit: 0.3, confidence: 0.9, dealbreaker: 0.1 },
+      }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone 13' };
+    const onScreen = tile('851', 'iPhone 13 128GB, Palermo');
+    const offScreen = tile('852', 'Moto G charger cable');
+
+    await session.judgeWave(brief, [onScreen, offScreen], true);
+    expect(gateway.requests).toHaveLength(1);
+
+    // Only 851 is on screen for the rescore: it is asked again while 852
+    // keeps its stored judgment in the panel.
+    const rescored = await session.rescore(brief, [onScreen], true);
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1]!.state.listings.map((listing) => listing.id)).toEqual(['851']);
+    expect(rescored.badges).toEqual([{ id: '851', text: 'MATCH 2.6', tone: 'match' }]);
+    expect(rescored.unpainted).toEqual([]);
+    expect(rescored.panel.entries).toEqual([
+      { id: '851', title: 'iPhone 13 128GB', verdict: 'MATCH', fit: 2.6, reason: null },
+      { id: '852', title: 'Moto G charger cable', verdict: 'SKIP', fit: 0.3, reason: null },
+    ]);
+    expect(rescored.panel.scanned).toBe(3);
+  });
+
+  it('leaves a failed rescore chunk unpainted while other judgments remain', async () => {
+    const ids = Array.from({ length: 13 }, (_, index) => `${860 + index}`);
+    const scripted: Record<string, ScriptedVerdict> = Object.fromEntries(
+      ids.map((id) => [id, { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 }]),
+    );
+    let rescoring = false;
+    const gateway = new ScriptedGateway((request) => {
+      if (rescoring && request.state.listings.length === 1) {
+        return { ok: false, error: 'Jev timed out.', ms: 90 };
+      }
+      return answersFor(scripted, 110, 0.001)(request);
+    });
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'lamp' };
+    const snapshots = ids.map((id) => tile(id, `Lamp ${id}, Palermo`));
+
+    await session.judgeWave(brief, snapshots, true);
+    expect(gateway.requests).toHaveLength(2);
+
+    rescoring = true;
+    const rescored = await session.rescore(brief, snapshots, true);
+    expect(gateway.requests).toHaveLength(4);
+    // The failed chunk is unpainted relative to the new attempt: no new
+    // badge, the error surfaces, and nothing retries by itself.
+    expect(rescored.badges).toHaveLength(12);
+    expect(rescored.unpainted).toEqual(['872']);
+    expect(rescored.panel.error).toBe('Jev timed out.');
+    expect(rescored.panel.lastMs).toBe(90);
+    expect(rescored.panel.totalCost).toBeCloseTo(0.003, 6);
+    // The other twelve carry fresh verdicts; the failed id keeps its stored
+    // judgment and every other judgment remains.
+    expect(rescored.panel.entries).toHaveLength(13);
+    expect(rescored.panel.kept).toBe(13);
+
+    // The stored judgment for the failed id still satisfies a plain wave,
+    // unsent, and clears the error.
+    const repaint = await session.judgeWave(brief, [tile('872', 'Lamp 872, Palermo')], true);
+    expect(gateway.requests).toHaveLength(4);
+    expect(repaint.badges).toEqual([{ id: '872', text: 'MATCH 2.5', tone: 'match' }]);
+    expect(repaint.panel.error).toBeNull();
+  });
+
+  it('leaves a failed opened rescore unpainted while the stored judgment remains', async () => {
+    let rescoring = false;
+    const gateway = new ScriptedGateway((request) => {
+      const listing = request.state.listings[0]!;
+      const described = (listing as { description?: unknown }).description !== undefined;
+      if (rescoring && described) {
+        return { ok: false, error: 'Jev timed out.', ms: 90 };
+      }
+      const scripted = described
+        ? { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 }
+        : { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 };
+      const answers: Record<string, AnswerValue> = {};
+      for (const question of request.questions) {
+        answers[question.name] =
+          question.kind === 'score'
+            ? { kind: 'score', value: scripted.fit, confidence: scripted.confidence }
+            : { kind: 'noul', probabilityTrue: scripted.dealbreaker };
+      }
+      return { ok: true, answers, ms: 120, cost: 0.001 };
+    });
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone 13' };
+    const name = 'iPhone 13 128GB, Palermo';
+
+    await session.judgeWave(brief, [tile('891', name)], true);
+    expect(gateway.requests).toHaveLength(1);
+
+    rescoring = true;
+    const rescored = await session.rescore(brief, [tile('891', name, 'Cracked back glass.')], true);
+    expect(gateway.requests).toHaveLength(2);
+    const request = gateway.requests[1]!;
+    expect(request.state.listings).toHaveLength(1);
+    expect(request.state.listings[0]).toMatchObject({
+      id: '891',
+      description: 'Cracked back glass.',
+    });
+    expect(rescored.badges).toEqual([]);
+    expect(rescored.unpainted).toEqual(['891']);
+    expect(rescored.panel.error).toBe('Jev timed out.');
+    expect(rescored.panel.entries).toEqual([
+      { id: '891', title: 'iPhone 13 128GB', verdict: 'MATCH', fit: 2.6, reason: null },
+    ]);
+
+    // The stored grid judgment still satisfies a plain wave, unsent.
+    const repaint = await session.judgeWave(brief, [tile('891', name)], true);
+    expect(gateway.requests).toHaveLength(2);
+    expect(repaint.badges).toEqual([{ id: '891', text: 'MATCH 2.6', tone: 'match' }]);
+  });
+
+  it('sends nothing on rescore with an empty query and holds survivors with a missing key', async () => {
+    const gateway = new ScriptedGateway(() => ok());
+    const session = new MarketplaceSession(gateway);
+
+    const empty = await session.rescore({ query: '  ' }, [tile('881', 'Lamp, Palermo')], true);
+    expect(gateway.requests).toHaveLength(0);
+    expect(empty.badges).toEqual([]);
+    expect(empty.unpainted).toEqual([]);
+    expect(empty.panel.status).toBe('need-query');
+    expect(empty.panel.scanned).toBe(0);
+
+    // Local SKIP tiles still paint without a key; survivors wait unsent.
+    const brief = { query: 'iPhone', maxPrice: 200000, currency: 'ARS' as const };
+    const keyless = await session.rescore(
+      brief,
+      [
+        tile('882', 'iPhone 13 128GB, $ 150.000, Palermo'),
+        tile('883', 'iPhone 13 128GB, $ 250.000, Palermo'),
+      ],
+      false,
+    );
+    expect(gateway.requests).toHaveLength(0);
+    expect(keyless.badges).toEqual([{ id: '883', text: 'SKIP price', tone: 'skip' }]);
+    expect(keyless.unpainted).toEqual([]);
+    expect(keyless.panel.status).toBe('need-key');
+    expect(keyless.panel.notice).toMatch(/options page/i);
+
+    // A stored survivor judgment survives a keyless rescore untouched.
+    const keyed = new ScriptedGateway(
+      answersFor({ '884': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 } }),
+    );
+    const stored = new MarketplaceSession(keyed);
+    await stored.judgeWave({ query: 'lamp' }, [tile('884', 'Lamp, Palermo')], true);
+    const held = await stored.rescore({ query: 'lamp' }, [tile('884', 'Lamp, Palermo')], false);
+    expect(keyed.requests).toHaveLength(1);
+    expect(held.badges).toEqual([]);
+    expect(held.unpainted).toEqual([]);
+    expect(held.panel.status).toBe('need-key');
+    expect(held.panel.entries).toEqual([
+      { id: '884', title: 'Lamp', verdict: 'MATCH', fit: 2.6, reason: null },
+    ]);
+  });
+});

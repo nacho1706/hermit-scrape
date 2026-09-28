@@ -1,4 +1,4 @@
-// Behavioral core for the Deal Hunter marketplace slices (#2 through #5).
+// Behavioral core for the Deal Hunter marketplace slices (#2 through #6).
 //
 // The marketplace session decides verdicts. Adapters (tile reader, Jev gateway,
 // grid painter, side panel, stores) surround it and are not covered by tests.
@@ -822,6 +822,131 @@ export class MarketplaceSession {
     let waveError: string | null = null;
     for (const listing of survivors) {
       const single = await this.sendOpened(normalized, listing, hash);
+      badges.push(...single.badges);
+      unpainted.push(...single.unpainted);
+      waveError ??= single.error;
+    }
+    this.lastError = waveError;
+
+    return { badges, unpainted, panel: this.panel('ready', null) };
+  }
+
+  // Judges the survivors currently on screen again, ignoring the stored
+  // judgment for each of them. Local SKIP tiles on screen stay local and
+  // unsent. Tiles that are not on screen keep their stored judgments: only
+  // the ids in this call are ever replaced. A failed chunk leaves those ids
+  // unpainted relative to this attempt without clearing their stored
+  // judgments, records the error, and schedules no retry.
+  async rescore(
+    brief: Brief,
+    snapshots: TileSnapshot[],
+    keyPresent: boolean,
+  ): Promise<WaveResult> {
+    const normalized = normalizeBrief(brief);
+    if (normalized.query.trim() === '') {
+      return {
+        badges: [],
+        unpainted: [],
+        panel: this.panel('need-query', NEED_QUERY_NOTICE),
+      };
+    }
+    const hash = briefHash(normalized);
+    if (this.briefHash !== hash) {
+      this.judgments.clear();
+      this.briefHash = hash;
+    }
+    const considered = snapshots.filter(
+      (snapshot) => itemId(snapshot.href) !== null,
+    );
+    this.scanned += considered.length;
+
+    const parsed = new Map<string, ParsedTile>();
+    const descriptions = new Map<string, string | undefined>();
+    const order: string[] = [];
+    for (const snapshot of considered) {
+      const id = itemId(snapshot.href) as string;
+      if (!parsed.has(id)) {
+        parsed.set(id, parseTile(snapshot.name, normalized.currency));
+        descriptions.set(id, snapshot.description);
+        order.push(id);
+      }
+    }
+    const freeBadges: Badge[] = [];
+    const survivors: ListingState[] = [];
+    const openedSurvivors: ListingState[] = [];
+    for (const id of order) {
+      const tile = parsed.get(id)!;
+      const reason = localReasonFor(tile, normalized);
+      if (reason !== null) {
+        const judgment = this.localJudgment(id, tile, reason, hash);
+        this.storeLocal(judgment);
+        freeBadges.push(badgeFor(judgment));
+        continue;
+      }
+      const description = descriptions.get(id);
+      if (description !== undefined) {
+        openedSurvivors.push({
+          id,
+          title: tile.title,
+          price: tile.price,
+          currency: tile.currency,
+          place: tile.place,
+          description,
+        });
+      } else {
+        survivors.push({
+          id,
+          title: tile.title,
+          price: tile.price,
+          currency: tile.currency,
+          place: tile.place,
+        });
+      }
+    }
+
+    if (!keyPresent) {
+      return {
+        badges: freeBadges,
+        unpainted: [],
+        panel: this.panel('need-key', NEED_KEY_NOTICE),
+      };
+    }
+
+    const badges: Badge[] = [...freeBadges];
+    const unpainted: string[] = [];
+    let waveError: string | null = null;
+    for (let start = 0; start < survivors.length; start += CHUNK_SIZE) {
+      const chunk = survivors.slice(start, start + CHUNK_SIZE);
+      const result = await this.gateway.send(this.requestFor(normalized, chunk));
+      this.lastMs = result.ms;
+      if (!result.ok) {
+        waveError ??= result.error;
+        unpainted.push(...chunk.map((listing) => listing.id));
+        continue;
+      }
+      this.totalCost += result.cost;
+      for (const listing of chunk) {
+        const answers = parseAnswers(result.answers, listing.id);
+        if (answers === null) {
+          waveError ??= `Jev omitted the answers for listing ${listing.id}.`;
+          unpainted.push(listing.id);
+          continue;
+        }
+        const judgment = this.modelJudgment(listing, answers, result.ms, hash, false, null);
+        // The fresh grid verdict replaces the badge, so a described entry
+        // for the same item drops instead of keeping the win on screen.
+        this.judgments.delete(cacheKey(listing.id, true));
+        this.storeGrid(judgment);
+        badges.push(badgeFor(judgment));
+      }
+    }
+    for (const listing of openedSurvivors) {
+      const single = await this.sendOpened(normalized, listing, hash);
+      if (single.badges.length > 0) {
+        // The fresh described verdict is the single entry for the item; the
+        // pre-rescore grid entry drops with it. Failures leave both alone.
+        this.judgments.delete(cacheKey(listing.id, false));
+      }
       badges.push(...single.badges);
       unpainted.push(...single.unpainted);
       waveError ??= single.error;
