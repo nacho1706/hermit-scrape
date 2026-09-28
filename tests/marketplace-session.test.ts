@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { MarketplaceSession } from '../src/session/marketplace';
 import type {
   AnswerValue,
+  Brief,
   DecisionRequest,
   Gateway,
   GatewayResult,
@@ -930,5 +931,290 @@ describe('marketplace session hard limits (#3)', () => {
     expect(gateway.requests).toHaveLength(1);
     expect(gateway.requests[0]!.state.query).toBe('iPhone 13');
     expect(result.badges).toEqual([{ id: '141', text: 'SKIP 0.3', tone: 'skip' }]);
+  });
+});
+
+describe('marketplace session score cache (#4)', () => {
+  const tile = (id: string, name: string) => ({
+    href: `https://www.facebook.com/marketplace/item/${id}/`,
+    name,
+  });
+
+  it('reuses grid judgments when a tile comes back and keeps off-screen listings in the panel', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({
+        '101': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 },
+        '202': { fit: 0.3, confidence: 0.9, dealbreaker: 0.1 },
+      }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone 13' };
+    const a = tile('101', 'iPhone 13 128GB, $ 250.000, Palermo');
+    const b = tile('202', 'Moto G charger cable');
+
+    const first = await session.judgeWave(brief, [a, b], true);
+    expect(gateway.requests).toHaveLength(1);
+    expect(first.badges).toEqual([
+      { id: '101', text: 'MATCH 2.6', tone: 'match' },
+      { id: '202', text: 'SKIP 0.3', tone: 'skip' },
+    ]);
+
+    // Tile 202 scrolls away: no new call, and the panel keeps it.
+    const second = await session.judgeWave(brief, [a], true);
+    expect(gateway.requests).toHaveLength(1);
+    expect(second.badges).toEqual([{ id: '101', text: 'MATCH 2.6', tone: 'match' }]);
+    expect(second.unpainted).toEqual([]);
+    expect(second.panel.entries.map((entry) => entry.id)).toEqual(['101', '202']);
+    expect(second.panel.scanned).toBe(3);
+    expect(second.panel.lastMs).toBe(first.panel.lastMs);
+    expect(second.panel.totalCost).toBeCloseTo(first.panel.totalCost, 6);
+
+    // Tile 202 scrolls back: repainted from the cache, still no new call.
+    const third = await session.judgeWave(brief, [a, b], true);
+    expect(gateway.requests).toHaveLength(1);
+    expect(third.badges).toEqual(first.badges);
+    expect(third.panel.entries.map((entry) => entry.id)).toEqual(['101', '202']);
+  });
+
+  it('scores the same item again when its price changes', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '301': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone 13', maxPrice: 300000, currency: 'ARS' as const };
+
+    const first = await session.judgeWave(
+      brief,
+      [tile('301', 'iPhone 13 128GB, $ 250.000, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(first.badges).toEqual([{ id: '301', text: 'MATCH 2.6', tone: 'match' }]);
+
+    const second = await session.judgeWave(
+      brief,
+      [tile('301', 'iPhone 13 128GB, $ 260.000, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1]!.state.listings).toEqual([
+      { id: '301', title: 'iPhone 13 128GB', price: 260000, currency: 'ARS', place: 'Palermo' },
+    ]);
+    expect(second.badges).toEqual([{ id: '301', text: 'MATCH 2.6', tone: 'match' }]);
+  });
+
+  it('rejects the same item locally when only its currency changes', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '302': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone 13', maxPrice: 300000, currency: 'ARS' as const };
+
+    const first = await session.judgeWave(
+      brief,
+      [tile('302', 'iPhone 13 128GB, $ 250.000, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(first.badges).toEqual([{ id: '302', text: 'MATCH 2.6', tone: 'match' }]);
+
+    // Same digits, now dollars against a peso brief: the stored MATCH no
+    // longer applies, and the tile is a local SKIP without a new call.
+    const second = await session.judgeWave(
+      brief,
+      [tile('302', 'iPhone 13 128GB, US$ 250.000, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(second.badges).toEqual([{ id: '302', text: 'SKIP currency', tone: 'skip' }]);
+    expect(second.panel.entries).toEqual([
+      { id: '302', title: 'iPhone 13 128GB', verdict: 'SKIP', fit: null, reason: 'currency' },
+    ]);
+  });
+
+  it('clears every stored judgment and rescores the screen when the query changes', async () => {
+    let calls = 0;
+    const gateway = new ScriptedGateway((request) => {
+      calls += 1;
+      const rescore = calls > 1;
+      return answersFor({
+        '401': rescore
+          ? { fit: 0.2, confidence: 0.9, dealbreaker: 0.1 }
+          : { fit: 2.8, confidence: 0.9, dealbreaker: 0.0 },
+        '402': { fit: 2.7, confidence: 0.9, dealbreaker: 0.0 },
+      })(request);
+    });
+    const session = new MarketplaceSession(gateway);
+
+    const first = await session.judgeWave(
+      { query: 'iPhone 13' },
+      [tile('401', 'iPhone 13 128GB, Palermo'), tile('402', 'iPhone 13 mini, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(first.panel.entries.map((entry) => entry.id)).toEqual(['401', '402']);
+
+    // A new query drops the stored MATCH for 401 and the off-screen 402,
+    // then judges what is on screen again under the new brief.
+    const second = await session.judgeWave(
+      { query: 'iPhone 14' },
+      [tile('401', 'iPhone 13 128GB, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(2);
+    expect(gateway.requests[1]!.state.query).toBe('iPhone 14');
+    expect(gateway.requests[1]!.state.listings.map((listing) => listing.id)).toEqual(['401']);
+    expect(second.badges).toEqual([{ id: '401', text: 'SKIP 0.2', tone: 'skip' }]);
+    expect(second.panel.entries).toEqual([
+      { id: '401', title: 'iPhone 13 128GB', verdict: 'SKIP', fit: 0.2, reason: null },
+    ]);
+  });
+
+  it.each([
+    { field: 'query', edit: { query: 'ebike' }, requests: 2, badge: 'MATCH 2.5' },
+    { field: 'max price', edit: { maxPrice: 600 }, requests: 2, badge: 'MATCH 2.5' },
+    { field: 'currency', edit: { currency: 'USD' }, requests: 2, badge: 'MATCH 2.5' },
+    { field: 'places', edit: { places: ['Recoleta'] }, requests: 1, badge: 'SKIP location' },
+    { field: 'note', edit: { note: 'must be red' }, requests: 2, badge: 'MATCH 2.5' },
+  ] as Array<{ field: string; edit: Partial<Brief>; requests: number; badge: string }>)('drops the stored judgment when the brief $field changes', async ({ edit, requests, badge }) => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '451': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const base = {
+      query: 'bike',
+      maxPrice: 500,
+      currency: 'ARS' as const,
+      places: ['Palermo'],
+      note: 'no cracks',
+    };
+    const snapshot = tile('451', 'Bike, $ 100, Palermo');
+
+    const first = await session.judgeWave(base, [snapshot], true);
+    expect(gateway.requests).toHaveLength(1);
+    expect(first.badges).toEqual([{ id: '451', text: 'MATCH 2.5', tone: 'match' }]);
+
+    const second = await session.judgeWave({ ...base, ...edit }, [snapshot], true);
+    expect(gateway.requests).toHaveLength(requests);
+    expect(second.badges).toEqual([{ id: '451', text: badge, tone: badge.startsWith('MATCH') ? 'match' : 'skip' }]);
+  });
+
+  it('keeps the cache when the brief is rebuilt with the same values', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '452': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const brief = {
+      query: 'bike',
+      maxPrice: 500,
+      currency: 'ARS' as const,
+      places: ['Palermo'],
+      note: 'no cracks',
+    };
+    const snapshot = tile('452', 'Bike, $ 100, Palermo');
+
+    await session.judgeWave(brief, [snapshot], true);
+    // A new object with equal values (as the stores deliver) is still a hit.
+    const second = await session.judgeWave({ ...brief, places: [...brief.places] }, [snapshot], true);
+    expect(gateway.requests).toHaveLength(1);
+    expect(second.badges).toEqual([{ id: '452', text: 'MATCH 2.5', tone: 'match' }]);
+  });
+
+  it('treats any brief-field edit, however small, as a new brief', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '453': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const snapshot = tile('453', 'Bike, $ 100, Palermo');
+
+    await session.judgeWave({ query: 'bike' }, [snapshot], true);
+    // A trailing space is still an edit: the stored judgment drops and the
+    // tile is scored again.
+    await session.judgeWave({ query: 'bike ' }, [snapshot], true);
+    expect(gateway.requests).toHaveLength(2);
+  });
+
+  it('never sends local SKIP listings on a brief-edit rescore and still chunks survivors', async () => {
+    const survivorIds = Array.from({ length: 13 }, (_, index) => `${610 + index}`);
+    const scripted: Record<string, ScriptedVerdict> = Object.fromEntries(
+      survivorIds.map((id) => [id, { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 }]),
+    );
+    const gateway = new ScriptedGateway(answersFor(scripted));
+    const session = new MarketplaceSession(gateway);
+    const base = { query: 'lamp', maxPrice: 1000, currency: 'ARS' as const };
+    const over = tile('600', 'Lamp, $ 9.999, Palermo');
+    const survivors = survivorIds.map((id) => tile(id, `Lamp ${id}, $ 100, Palermo`));
+
+    const first = await session.judgeWave(base, [over, ...survivors], true);
+    expect(gateway.requests).toHaveLength(2);
+    expect(first.badges[0]).toEqual({ id: '600', text: 'SKIP price', tone: 'skip' });
+
+    const second = await session.judgeWave(
+      { ...base, note: 'must be red' },
+      [over, ...survivors],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(4);
+    for (const request of gateway.requests.slice(2)) {
+      expect(request.state.note).toBe('must be red');
+      expect(request.state.listings.map((listing) => listing.id)).not.toContain('600');
+      expect(request.questions.every((question) => !question.name.includes('600'))).toBe(true);
+    }
+    expect(gateway.requests[2]!.state.listings).toHaveLength(12);
+    expect(gateway.requests[3]!.state.listings).toHaveLength(1);
+    expect(second.badges).toHaveLength(14);
+    expect(second.badges[0]).toEqual({ id: '600', text: 'SKIP price', tone: 'skip' });
+    expect(second.panel.kept).toBe(13);
+    expect(second.panel.skipped).toBe(1);
+    expect(second.panel.scanned).toBe(28);
+  });
+
+  it('reuses stored judgments after a reload in the same browser session', async () => {
+    const scripted = {
+      '701': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 },
+      '702': { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 },
+      '703': { fit: 0.3, confidence: 0.9, dealbreaker: 0.1 },
+    };
+    const before = new ScriptedGateway(answersFor(scripted));
+    const brief = { query: 'iPhone', maxPrice: 200000, currency: 'ARS' as const };
+    const snapshots = [
+      tile('704', 'iPhone 13 128GB, $ 250.000, Palermo'),
+      tile('701', 'iPhone 13 128GB, $ 150.000, Palermo'),
+      tile('702', 'iPhone 12, $ 150.000, Palermo'),
+      tile('703', 'Charger cable, $ 5.000, Palermo'),
+    ];
+
+    const firstSession = new MarketplaceSession(before);
+    const first = await firstSession.judgeWave(brief, snapshots, true);
+    expect(before.requests).toHaveLength(1);
+    expect(first.badges).toEqual([
+      { id: '704', text: 'SKIP price', tone: 'skip' },
+      { id: '701', text: 'MATCH 2.6', tone: 'match' },
+      { id: '702', text: 'REVIEW 1.5', tone: 'review' },
+      { id: '703', text: 'SKIP 0.3', tone: 'skip' },
+    ]);
+    // MATCH, then REVIEW, then SKIP with higher fit first; the local SKIP
+    // follows the model SKIP.
+    expect(first.panel.entries.map((entry) => entry.id)).toEqual(['701', '702', '703', '704']);
+
+    // A reload rebuilds the session from the browser-session cache: the same
+    // tiles repaint with no new call, and the panel keeps every judgment.
+    const after = new ScriptedGateway(answersFor(scripted));
+    const reloaded = new MarketplaceSession(after, firstSession.snapshot());
+    expect(after.requests).toHaveLength(0);
+
+    const preview = reloaded.preview(brief, true);
+    expect(preview.entries).toEqual(first.panel.entries);
+    expect(preview.totalCost).toBeCloseTo(first.panel.totalCost, 6);
+    expect(after.requests).toHaveLength(0);
+
+    const second = await reloaded.judgeWave(brief, snapshots, true);
+    expect(after.requests).toHaveLength(0);
+    expect(second.badges).toEqual(first.badges);
+    expect(second.unpainted).toEqual([]);
+    expect(second.panel.entries).toEqual(first.panel.entries);
+    expect(second.panel.scanned).toBe(8);
+    expect(second.panel.lastMs).toBe(first.panel.lastMs);
+    expect(second.panel.totalCost).toBeCloseTo(first.panel.totalCost, 6);
   });
 });

@@ -394,7 +394,7 @@ function decideVerdict(
   return 'REVIEW';
 }
 
-interface Judgment {
+export interface Judgment {
   id: string;
   title: string;
   verdict: Verdict;
@@ -407,6 +407,47 @@ interface Judgment {
   price: number | null;
   currency: string | null;
   place: string;
+  // Hash of the brief this judgment was scored under. A grid judgment is
+  // reused only when the item id, price, currency, and brief all match.
+  briefHash: string;
+}
+
+// The browser-session cache: everything a reloaded page needs to repaint
+// without paying again. Persisted in session storage, so it survives a
+// reload but never a browser restart. The brief and the key live in local
+// storage and do survive restarts.
+export interface SessionSnapshot {
+  judgments: Judgment[];
+  scanned: number;
+  totalCost: number;
+  lastMs: number | null;
+  lastError: string | null;
+  briefHash: string | null;
+}
+
+// Identity of a brief for the score cache. Any edit to the query, max
+// price, currency, place list, or note is a new identity and drops every
+// stored judgment. The content script shares this function so both layers
+// always agree on whether the brief changed.
+export function briefHashFor(brief: Brief): string {
+  return briefHash(normalizeBrief(brief));
+}
+
+function briefHash(brief: NormalizedBrief): string {
+  const canonical = JSON.stringify({
+    query: brief.query,
+    maxPrice: brief.maxPrice,
+    currency: brief.currency,
+    places: brief.places,
+    note: brief.note,
+  });
+  // FNV-1a over the canonical brief: deterministic, no dependencies.
+  let hash = 0x811c9dc5;
+  for (let index = 0; index < canonical.length; index += 1) {
+    hash ^= canonical.charCodeAt(index);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16);
 }
 
 interface ParsedAnswers {
@@ -468,11 +509,39 @@ export class MarketplaceSession {
   private totalCost = 0;
   private lastMs: number | null = null;
   private lastError: string | null = null;
+  private briefHash: string | null = null;
 
-  constructor(private readonly gateway: Gateway) {}
+  constructor(
+    private readonly gateway: Gateway,
+    snapshot?: SessionSnapshot | null,
+  ) {
+    if (snapshot !== undefined && snapshot !== null) {
+      for (const judgment of snapshot.judgments ?? []) {
+        this.judgments.set(judgment.id, { ...judgment });
+      }
+      this.scanned = snapshot.scanned;
+      this.totalCost = snapshot.totalCost;
+      this.lastMs = snapshot.lastMs;
+      this.lastError = snapshot.lastError;
+      this.briefHash = snapshot.briefHash;
+    }
+  }
+
+  // Captures the browser-session cache for session storage. The copy is
+  // detached: later waves never mutate a snapshot already handed out.
+  snapshot(): SessionSnapshot {
+    return {
+      judgments: [...this.judgments.values()].map((judgment) => ({ ...judgment })),
+      scanned: this.scanned,
+      totalCost: this.totalCost,
+      lastMs: this.lastMs,
+      lastError: this.lastError,
+      briefHash: this.briefHash,
+    };
+  }
 
   // The current panel without sending or counting: for the side panel's
-  // first paint and for brief edits that must not rescore (#4 owns rescore).
+  // first paint.
   preview(brief: Brief, keyPresent: boolean): PanelModel {
     if (brief.query.trim() === '') {
       return this.panel('need-query', NEED_QUERY_NOTICE);
@@ -496,6 +565,13 @@ export class MarketplaceSession {
         panel: this.panel('need-query', NEED_QUERY_NOTICE),
       };
     }
+    const hash = briefHash(normalized);
+    if (this.briefHash !== hash) {
+      // A new brief drops every stored judgment, including listings that
+      // have left the grid, and the wave below rescores the screen fresh.
+      this.judgments.clear();
+      this.briefHash = hash;
+    }
     const considered = snapshots.filter(
       (snapshot) => itemId(snapshot.href) !== null,
     );
@@ -513,10 +589,22 @@ export class MarketplaceSession {
         order.push(id);
       }
     }
-    const localBadges: Badge[] = [];
+    // Badges that cost no call: fresh local SKIP badges plus stored
+    // judgments whose item id, price, currency, and brief still match.
+    const freeBadges: Badge[] = [];
     const survivors: ListingState[] = [];
     for (const id of order) {
       const tile = parsed.get(id)!;
+      const cached = this.judgments.get(id);
+      if (
+        cached !== undefined &&
+        cached.price === tile.price &&
+        cached.currency === tile.currency &&
+        cached.briefHash === hash
+      ) {
+        freeBadges.push(badgeFor(cached));
+        continue;
+      }
       const reason = localReasonFor(tile, normalized);
       if (reason !== null) {
         const judgment: Judgment = {
@@ -531,9 +619,10 @@ export class MarketplaceSession {
           price: tile.price,
           currency: tile.currency,
           place: tile.place,
+          briefHash: hash,
         };
         this.judgments.set(id, judgment);
-        localBadges.push(badgeFor(judgment));
+        freeBadges.push(badgeFor(judgment));
       } else {
         survivors.push({
           id,
@@ -545,18 +634,18 @@ export class MarketplaceSession {
       }
     }
 
-    // Local rejects paint without a key; survivors wait for one. Survivors
-    // stay out of `unpainted` so the content script retries them once a key
-    // (or query) unlocks the wave.
+    // Local rejects and stored judgments paint without a key; unsent
+    // survivors wait for one. Survivors stay out of `unpainted` so the
+    // content script retries them once a key (or query) unlocks the wave.
     if (!keyPresent) {
       return {
-        badges: localBadges,
+        badges: freeBadges,
         unpainted: [],
         panel: this.panel('need-key', NEED_KEY_NOTICE),
       };
     }
 
-    const badges: Badge[] = [...localBadges];
+    const badges: Badge[] = [...freeBadges];
     const unpainted: string[] = [];
     let waveError: string | null = null;
     for (let start = 0; start < survivors.length; start += CHUNK_SIZE) {
@@ -588,6 +677,7 @@ export class MarketplaceSession {
           price: listing.price,
           currency: listing.currency,
           place: listing.place,
+          briefHash: hash,
         };
         this.judgments.set(listing.id, judgment);
         badges.push(badgeFor(judgment));

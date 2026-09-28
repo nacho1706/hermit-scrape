@@ -1,5 +1,5 @@
 import { browser } from 'wxt/browser';
-import { MarketplaceSession, itemId } from '../src/session/marketplace';
+import { MarketplaceSession, briefHashFor, itemId } from '../src/session/marketplace';
 import type {
   Badge,
   BadgeTone,
@@ -9,6 +9,7 @@ import { createOpenRouterGateway } from '../src/gateway/openrouter';
 import { briefStore } from '../src/stores/brief';
 import type { BriefState } from '../src/stores/brief';
 import { hasKey, keyStore } from '../src/stores/key';
+import { scoresStore } from '../src/stores/scores';
 import { VIEW_UPDATED, isGetView } from '../src/messaging';
 import type { ViewPayload } from '../src/messaging';
 
@@ -28,17 +29,29 @@ export default defineContentScript({
     '*://web.facebook.com/marketplace/create*',
     '*://web.facebook.com/marketplace/inbox*',
   ],
-  main(ctx) {
+  async main(ctx) {
     if (!isWatchedRoute(window.location.pathname)) return;
 
-    const session = new MarketplaceSession(createOpenRouterGateway());
-    const badges = new Map<string, Badge>();
+    // A reload restores this browser session's judgments so the grid
+    // repaints without paying again. A missing or unreadable cache scores
+    // the screen fresh.
+    const stored = await scoresStore.getValue().catch(() => null);
+    const session = new MarketplaceSession(createOpenRouterGateway(), stored);
+    // Painted badges by item id, with the accessible name they were painted
+    // for. A remounted tile repaints from memory only when its label is
+    // unchanged; a changed label rejoins the wave so the session can tell
+    // a cache hit from a changed price.
+    const badges = new Map<string, { badge: Badge; name: string }>();
     // Attempted but unpainted ids (failed call or omitted answers). They stay
     // out of later automatic waves: a failed chunk never retries by itself.
     // #6 Rescore will clear this set on explicit shopper request.
     const failed = new Set<string>();
     let running = false;
     let queued: TileSnapshot[] = [];
+    // Bumped on every brief edit so a wave in flight cannot paint stale
+    // badges over the cleared screen.
+    let briefEpoch = 0;
+    let lastBrief = briefHashFor(await briefStore.getValue());
 
     // A burst of newly appeared tiles collapses into one wave. The interval
     // is ours to choose; 400ms covers fast scrolls without feeling laggy.
@@ -84,13 +97,17 @@ export default defineContentScript({
         if (anchor.dataset['dealHunterBadge'] !== undefined) continue;
         const id = itemId(anchor.href);
         if (id === null || failed.has(id)) continue;
+        const name = accessibleName(anchor);
         const known = badges.get(id);
-        if (known !== undefined) {
-          // Remounted tile: repaint from memory, never resend.
-          paintBadge(anchor, known);
+        if (known !== undefined && known.name === name) {
+          // Remounted tile, unchanged label: repaint from memory, never resend.
+          paintBadge(anchor, known.badge);
           continue;
         }
-        snapshots.push({ href: anchor.href, name: accessibleName(anchor) });
+        // A changed label may mean a changed price: forget the stored badge
+        // and let the session decide cache hit vs rescore.
+        badges.delete(id);
+        snapshots.push({ href: anchor.href, name });
       }
       return snapshots;
     }
@@ -110,13 +127,26 @@ export default defineContentScript({
           if (fresh.length === 0) continue;
           if (!isWatchedRoute(window.location.pathname)) return;
           const brief = await briefStore.getValue();
+          const waveBriefEpoch = briefEpoch;
           const result = await session.judgeWave(brief, fresh, await hasKey());
+          // A brief edit cleared the screen mid-wave: drop the stale paint.
+          // The fresh wave already queued behind this one does the rescore.
+          if (waveBriefEpoch !== briefEpoch) continue;
+          // First snapshot wins per item id, mirroring the session's parse.
+          const names = new Map<string, string>();
+          for (const snapshot of fresh) {
+            const id = itemId(snapshot.href) as string;
+            if (!names.has(id)) names.set(id, snapshot.name);
+          }
           for (const id of result.unpainted) failed.add(id);
           for (const badge of result.badges) {
-            badges.set(badge.id, badge);
+            // Every badge answers a waved snapshot, so the name is always
+            // known; the fallback only forces a re-wave on remount.
+            badges.set(badge.id, { badge, name: names.get(badge.id) ?? '' });
             paintBadges(badge);
           }
           pushView({ panel: result.panel, brief });
+          await scoresStore.setValue(session.snapshot()).catch(() => {});
         }
       } finally {
         running = false;
@@ -124,9 +154,16 @@ export default defineContentScript({
     }
 
     async function refreshAfterStoreChange(brief: BriefState): Promise<void> {
-      // A new key or a first query unlocks the tiles already on screen; a
-      // changed query does not rescore (#4 owns that), it only refreshes
-      // the panel's status line.
+      // A changed brief drops every painted badge and rescores the screen
+      // as a fresh wave; the session clears its stored judgments for the
+      // same brief. A new key or a first query only unlocks unpainted tiles.
+      const identity = briefHashFor(brief);
+      if (identity !== lastBrief) {
+        lastBrief = identity;
+        briefEpoch += 1;
+        clearBadges();
+        failed.clear();
+      }
       pushView({ panel: session.preview(brief, await hasKey()), brief });
       await runWave(collectSnapshots());
     }
@@ -145,6 +182,18 @@ export default defineContentScript({
       }
     }
 
+    // Drops every painted badge for a brief-edit rescore: the badge
+    // elements leave the DOM and the tiles become wave candidates again.
+    function clearBadges(): void {
+      for (const anchor of tileAnchors()) {
+        if (anchor.dataset['dealHunterBadge'] === undefined) continue;
+        anchor
+          .querySelectorAll(':scope > span[data-deal-hunter-badge-el]')
+          .forEach((element) => element.remove());
+        delete anchor.dataset['dealHunterBadge'];
+      }
+      badges.clear();
+    }
   },
 });
 
@@ -184,6 +233,7 @@ function paintBadge(anchor: HTMLAnchorElement, badge: Badge): void {
   const tone = TONE_STYLE[badge.tone];
   const element = document.createElement('span');
   element.textContent = badge.text;
+  element.dataset['dealHunterBadgeEl'] = badge.id;
   element.setAttribute('aria-hidden', 'true');
   element.style.position = 'absolute';
   element.style.top = '8px';
