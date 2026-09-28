@@ -1,4 +1,4 @@
-// Behavioral core for the Deal Hunter marketplace slices (#2 through #6).
+// Behavioral core for the Deal Hunter marketplace slices (#2 through #7).
 //
 // The marketplace session decides verdicts. Adapters (tile reader, Jev gateway,
 // grid painter, side panel, stores) surround it and are not covered by tests.
@@ -505,12 +505,76 @@ const VERDICT_RANK: Record<Verdict, number> = {
   SKIP: 2,
 };
 
-function compareEntries(a: PanelEntry, b: PanelEntry): number {
+function compareVerdictFit(
+  a: { verdict: Verdict; fit: number | null },
+  b: { verdict: Verdict; fit: number | null },
+): number {
   if (VERDICT_RANK[a.verdict] !== VERDICT_RANK[b.verdict]) {
     return VERDICT_RANK[a.verdict] - VERDICT_RANK[b.verdict];
   }
   // Higher fit first; a local SKIP (no fit) follows model SKIP entries.
   return (b.fit ?? -1) - (a.fit ?? -1);
+}
+
+function compareEntries(a: PanelEntry, b: PanelEntry): number {
+  return compareVerdictFit(a, b);
+}
+
+function compareJudgments(a: Judgment, b: Judgment): number {
+  return compareVerdictFit(a, b);
+}
+
+// CSV export (#7): one row per item id, the described judgment winning when
+// both exist. Columns in order: id, title, price, currency, location, url,
+// verdict, fit, fit confidence, dealbreaker, reason, milliseconds. Model
+// rows fill the score fields and leave reason empty; local SKIP rows fill
+// reason and leave the score fields and milliseconds empty.
+export const CSV_COLUMNS: readonly string[] = [
+  'id',
+  'title',
+  'price',
+  'currency',
+  'location',
+  'url',
+  'verdict',
+  'fit',
+  'fit confidence',
+  'dealbreaker',
+  'reason',
+  'milliseconds',
+];
+
+export const CSV_HEADER: string = CSV_COLUMNS.join(',');
+
+export function csvUrlFor(id: string): string {
+  return `https://www.facebook.com/marketplace/item/${id}/`;
+}
+
+export function escapeCsvField(value: string): string {
+  if (!/[",\n\r]/.test(value)) return value;
+  return `"${value.replace(/"/g, '""')}"`;
+}
+
+export function judgmentToCsvRow(judgment: Judgment): string {
+  const fields = [
+    judgment.id,
+    judgment.title,
+    judgment.price === null ? '' : `${judgment.price}`,
+    judgment.currency ?? '',
+    judgment.place,
+    csvUrlFor(judgment.id),
+    judgment.verdict,
+    judgment.fit === null ? '' : `${judgment.fit}`,
+    judgment.fitConfidence === null ? '' : `${judgment.fitConfidence}`,
+    judgment.dealbreaker === null ? '' : `${judgment.dealbreaker}`,
+    judgment.reason ?? '',
+    judgment.ms === null ? '' : `${judgment.ms}`,
+  ];
+  return fields.map(escapeCsvField).join(',');
+}
+
+export function judgmentsToCsv(judgments: Judgment[]): string {
+  return [CSV_HEADER, ...judgments.map(judgmentToCsvRow)].join('\n');
 }
 
 function cacheKey(id: string, described: boolean): string {
@@ -570,6 +634,18 @@ export class MarketplaceSession {
       return this.panel('need-key', NEED_KEY_NOTICE);
     }
     return this.panel('ready', null);
+  }
+
+  // Every judgment kept for this browser session as CSV, including listings
+  // that have left the grid. One row per item id in panel order; the
+  // described judgment wins when both exist.
+  exportCsv(): string {
+    return judgmentsToCsv(this.preferred().sort(compareJudgments));
+  }
+
+  // Alias kept for callers that name the conversion rather than the download.
+  toCsv(): string {
+    return this.exportCsv();
   }
 
   async judgeWave(

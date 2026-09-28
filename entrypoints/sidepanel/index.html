@@ -111,6 +111,26 @@
       #empty {
         color: #444;
       }
+      .actions {
+        display: flex;
+        gap: 8px;
+      }
+      #export-csv {
+        font: inherit;
+        font-weight: 600;
+        padding: 6px 12px;
+        border: 1px solid #dadce0;
+        border-radius: 4px;
+        background: #fff;
+        cursor: pointer;
+      }
+      #export-csv:hover:not(:disabled) {
+        background: #f1f3f4;
+      }
+      #export-csv:disabled {
+        color: #80868b;
+        cursor: default;
+      }
     </style>
   </head>
   <body>
@@ -150,6 +170,9 @@
         <div><dt>Last request</dt><dd id="stat-ms">—</dd></div>
         <div><dt>Session cost</dt><dd id="stat-cost">$0.0000</dd></div>
       </dl>
+      <div class="actions">
+        <button id="export-csv" type="button">Export CSV</button>
+      </div>
       <ul id="entries"></ul>
       <div id="empty">No judgments yet.</div>
     </div>

@@ -1791,3 +1791,180 @@ describe('marketplace session rescore (#6)', () => {
     ]);
   });
 });
+
+describe('marketplace session CSV export (#7)', () => {
+  const tile = (id: string, name: string, description?: string) => ({
+    href: `https://www.facebook.com/marketplace/item/${id}/`,
+    name,
+    ...(description === undefined ? {} : { description }),
+  });
+
+  const header =
+    'id,title,price,currency,location,url,verdict,fit,fit confidence,dealbreaker,reason,milliseconds';
+
+  function rows(csv: string): string[][] {
+    return csv
+      .split('\n')
+      .filter((line) => line !== '')
+      .map((line) => line.split(','));
+  }
+
+  it('exports the header with columns in order', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '101': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    await session.judgeWave(
+      { query: 'iPhone 13' },
+      [tile('101', 'iPhone 13 128GB, $ 250.000, Palermo')],
+      true,
+    );
+
+    const csv = session.exportCsv();
+    expect(csv.split('\n')[0]).toBe(header);
+  });
+
+  it('exports a model row with scores and an empty reason', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '101': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 } }, 120, 0.001),
+    );
+    const session = new MarketplaceSession(gateway);
+    await session.judgeWave(
+      { query: 'iPhone 13' },
+      [tile('101', 'iPhone 13 128GB, $ 250.000, Palermo')],
+      true,
+    );
+
+    const parsed = rows(session.exportCsv());
+    expect(parsed[0]).toEqual(header.split(','));
+    expect(parsed).toHaveLength(2);
+    expect(parsed[1]).toEqual([
+      '101',
+      'iPhone 13 128GB',
+      '250000',
+      'ARS',
+      'Palermo',
+      'https://www.facebook.com/marketplace/item/101/',
+      'MATCH',
+      '2.6',
+      '0.8',
+      '0.1',
+      '',
+      '120',
+    ]);
+  });
+
+  it('exports a local SKIP row with reason and empty model fields', async () => {
+    const gateway = new ScriptedGateway(() => ok());
+    const session = new MarketplaceSession(gateway);
+    await session.judgeWave(
+      { query: 'iPhone', maxPrice: 200000, currency: 'ARS' },
+      [tile('202', 'iPhone 13 128GB, $ 250.000, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(0);
+
+    const parsed = rows(session.exportCsv());
+    expect(parsed).toHaveLength(2);
+    expect(parsed[1]).toEqual([
+      '202',
+      'iPhone 13 128GB',
+      '250000',
+      'ARS',
+      'Palermo',
+      'https://www.facebook.com/marketplace/item/202/',
+      'SKIP',
+      '',
+      '',
+      '',
+      'price',
+      '',
+    ]);
+  });
+
+  it('exports every judged listing including ones that left the grid, one row per id', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({
+        '301': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 },
+        '302': { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 },
+      }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone' };
+    await session.judgeWave(
+      brief,
+      [tile('301', 'iPhone 13 128GB, Palermo'), tile('302', 'iPhone 12, Palermo')],
+      true,
+    );
+    // 302 scrolls away; a later wave only sees 301.
+    await session.judgeWave(brief, [tile('301', 'iPhone 13 128GB, Palermo')], true);
+
+    const parsed = rows(session.exportCsv());
+    expect(parsed[0]).toEqual(header.split(','));
+    expect(parsed.slice(1).map((row) => row[0]).sort()).toEqual(['301', '302']);
+    expect(parsed).toHaveLength(3);
+  });
+
+  it('exports the described judgment when both grid and described exist', async () => {
+    const gateway = new ScriptedGateway((request) => {
+      const listing = request.state.listings[0]!;
+      const described = (listing as { description?: unknown }).description !== undefined;
+      const scripted = described
+        ? { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 }
+        : { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 };
+      const answers: Record<string, AnswerValue> = {};
+      for (const question of request.questions) {
+        answers[question.name] =
+          question.kind === 'score'
+            ? { kind: 'score', value: scripted.fit, confidence: scripted.confidence }
+            : { kind: 'noul', probabilityTrue: scripted.dealbreaker };
+      }
+      return described
+        ? { ok: true, answers, ms: 210, cost: 0.002 }
+        : { ok: true, answers, ms: 120, cost: 0.001 };
+    });
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone 13' };
+    const name = 'iPhone 13 128GB, Palermo';
+    const description = 'Cracked back glass, battery at 78%.';
+
+    await session.judgeWave(brief, [tile('401', name)], true);
+    await session.judgeOpened(brief, tile('401', name, description), true);
+    expect(gateway.requests).toHaveLength(2);
+
+    const parsed = rows(session.exportCsv());
+    expect(parsed).toHaveLength(2);
+    expect(parsed[1]).toEqual([
+      '401',
+      'iPhone 13 128GB',
+      '',
+      '',
+      'Palermo',
+      'https://www.facebook.com/marketplace/item/401/',
+      'REVIEW',
+      '1.5',
+      '0.9',
+      '0.1',
+      '',
+      '210',
+    ]);
+  });
+
+  it('escapes commas and quotes in CSV fields', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '501': { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    await session.judgeWave(
+      { query: 'bike' },
+      [tile('501', 'Bike, mountain "trail", $ 100, Palermo')],
+      true,
+    );
+
+    const csv = session.exportCsv();
+    const lines = csv.split('\n');
+    expect(lines).toHaveLength(2);
+    // The title carries a comma and quotes, so it is quoted with doubled quotes.
+    expect(lines[1]).toContain('"Bike, mountain ""trail"""');
+  });
+});

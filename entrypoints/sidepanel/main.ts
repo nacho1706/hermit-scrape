@@ -3,7 +3,7 @@ import type { PanelModel, Verdict } from '../../src/session/marketplace';
 import { parseAmount } from '../../src/session/marketplace';
 import { briefStore } from '../../src/stores/brief';
 import type { BriefState } from '../../src/stores/brief';
-import { GET_VIEW, isViewUpdated } from '../../src/messaging';
+import { GET_CSV, GET_VIEW, isCsvPayload, isViewUpdated } from '../../src/messaging';
 import type { ViewPayload } from '../../src/messaging';
 
 // Side panel: brief editor plus a read-only ranking of the tab's judgments.
@@ -17,6 +17,7 @@ const noteInput = document.querySelector<HTMLTextAreaElement>('#note')!;
 const notice = document.querySelector('#notice')!;
 const entriesList = document.querySelector('#entries')!;
 const emptyState = document.querySelector('#empty')!;
+const exportButton = document.querySelector<HTMLButtonElement>('#export-csv')!;
 const stats: Record<string, HTMLElement> = {
   scanned: document.querySelector('#stat-scanned')!,
   kept: document.querySelector('#stat-kept')!,
@@ -62,6 +63,31 @@ placesInput.addEventListener('input', () => {
 noteInput.addEventListener('input', () => {
   queueSave({ note: noteInput.value });
 });
+
+exportButton.addEventListener('click', () => {
+  void downloadCsv();
+});
+
+async function downloadCsv(): Promise<void> {
+  if (tabId === null) return;
+  let csv: string;
+  try {
+    const reply: unknown = await browser.tabs.sendMessage(tabId, { type: GET_CSV });
+    if (!isCsvPayload(reply)) return;
+    csv = reply.csv;
+  } catch {
+    return;
+  }
+  const blob = new Blob([csv], { type: 'text/csv' });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = 'deal-hunter-session.csv';
+  document.body.append(anchor);
+  anchor.click();
+  anchor.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
 
 function readMaxPrice(value: string): number | null {
   const trimmed = value.trim();
@@ -135,6 +161,7 @@ const EMPTY_PANEL: PanelModel = {
 function applyNoTab(): void {
   notice.classList.remove('error');
   notice.textContent = 'Open a Marketplace grid to start judging.';
+  exportButton.disabled = true;
   // Never show another tab's judgments here.
   renderStats(EMPTY_PANEL);
   renderEntries(EMPTY_PANEL);
@@ -189,6 +216,8 @@ function renderEntries(panel: PanelModel): void {
   entriesList.replaceChildren();
   emptyState.textContent =
     panel.entries.length === 0 ? 'No judgments yet.' : '';
+  // CSV covers every kept judgment, so export needs a tab with judgments.
+  exportButton.disabled = tabId === null || panel.entries.length === 0;
   for (const entry of panel.entries) {
     const item = document.createElement('li');
     const chip = document.createElement('span');

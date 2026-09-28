@@ -10,8 +10,8 @@ import { briefStore } from '../src/stores/brief';
 import type { BriefState } from '../src/stores/brief';
 import { hasKey, keyStore } from '../src/stores/key';
 import { scoresStore } from '../src/stores/scores';
-import { VIEW_UPDATED, isGetView } from '../src/messaging';
-import type { ViewPayload } from '../src/messaging';
+import { VIEW_UPDATED, isGetCsv, isGetView } from '../src/messaging';
+import type { CsvPayload, ViewPayload } from '../src/messaging';
 
 // Marketplace grid watcher. Reads item tiles, sends them through the session
 // in debounced waves, and paints the verdict badges. It never clicks,
@@ -77,6 +77,9 @@ export default defineContentScript({
     });
 
     browser.runtime.onMessage.addListener((message: unknown) => {
+      if (isGetCsv(message)) {
+        return Promise.resolve({ csv: session.exportCsv() } satisfies CsvPayload);
+      }
       if (!isGetView(message)) return undefined;
       return (async (): Promise<ViewPayload> => {
         const brief = await briefStore.getValue();
