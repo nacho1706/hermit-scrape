@@ -1,4 +1,4 @@
-// Behavioral core for the Deal Hunter grid slices (#2, #3).
+// Behavioral core for the Deal Hunter marketplace slices (#2 through #5).
 //
 // The marketplace session decides verdicts. Adapters (tile reader, Jev gateway,
 // grid painter, side panel, stores) surround it and are not covered by tests.
@@ -24,6 +24,8 @@ export type LocalReason = 'price' | 'no price' | 'currency' | 'location';
 export interface TileSnapshot {
   href: string;
   name: string;
+  // Present only for a listing the shopper has opened.
+  description?: string;
 }
 
 export interface ListingState {
@@ -32,6 +34,8 @@ export interface ListingState {
   price: number | null;
   currency: string | null;
   place: string;
+  // Present only on the opened-listing request for that listing.
+  description?: string;
 }
 
 export interface ScoreQuestion {
@@ -410,6 +414,12 @@ export interface Judgment {
   // Hash of the brief this judgment was scored under. A grid judgment is
   // reused only when the item id, price, currency, and brief all match.
   briefHash: string;
+  // True for a judgment scored with the opened description. One item id can
+  // hold a grid entry and a described entry; the described one wins on screen.
+  described: boolean;
+  // The description the described judgment was scored with. Null on grid and
+  // local judgments. A later open reuses it only when the description matches.
+  description: string | null;
 }
 
 // The browser-session cache: everything a reloaded page needs to repaint
@@ -503,7 +513,13 @@ function compareEntries(a: PanelEntry, b: PanelEntry): number {
   return (b.fit ?? -1) - (a.fit ?? -1);
 }
 
+function cacheKey(id: string, described: boolean): string {
+  return `${described ? 'described' : 'grid'}:${id}`;
+}
+
 export class MarketplaceSession {
+  // One item id can hold a grid entry and a described entry; the described
+  // one wins on screen. Local SKIP judgments live in the grid slot.
   private readonly judgments = new Map<string, Judgment>();
   private scanned = 0;
   private totalCost = 0;
@@ -517,7 +533,11 @@ export class MarketplaceSession {
   ) {
     if (snapshot !== undefined && snapshot !== null) {
       for (const judgment of snapshot.judgments ?? []) {
-        this.judgments.set(judgment.id, { ...judgment });
+        // Older snapshots predate described judgments; they load as grid.
+        const described = (judgment as Partial<Judgment>).described ?? false;
+        const description = (judgment as Partial<Judgment>).description ?? null;
+        const full: Judgment = { ...judgment, described, description };
+        this.judgments.set(cacheKey(full.id, full.described), full);
       }
       this.scanned = snapshot.scanned;
       this.totalCost = snapshot.totalCost;
@@ -580,22 +600,69 @@ export class MarketplaceSession {
     // Parse once per item id; repeated tiles of one item share the first
     // snapshot. Hard limits split local SKIP badges from Jev survivors.
     // The product query is model context only, never a title word match.
+    // A snapshot carrying a description is an opened listing: it never joins
+    // a grid chunk and a grid judgment never satisfies it.
     const parsed = new Map<string, ParsedTile>();
+    const descriptions = new Map<string, string | undefined>();
     const order: string[] = [];
     for (const snapshot of considered) {
       const id = itemId(snapshot.href) as string;
       if (!parsed.has(id)) {
         parsed.set(id, parseTile(snapshot.name, normalized.currency));
+        descriptions.set(id, snapshot.description);
         order.push(id);
       }
     }
     // Badges that cost no call: fresh local SKIP badges plus stored
-    // judgments whose item id, price, currency, and brief still match.
+    // judgments whose item id, price, currency, and brief still match. Grid
+    // tiles prefer the described entry when both match; opened tiles only
+    // reuse a described entry with the same description.
     const freeBadges: Badge[] = [];
     const survivors: ListingState[] = [];
+    const openedSurvivors: ListingState[] = [];
     for (const id of order) {
       const tile = parsed.get(id)!;
-      const cached = this.judgments.get(id);
+      const description = descriptions.get(id);
+      if (description !== undefined) {
+        const cached = this.describedFor(id);
+        if (
+          cached !== undefined &&
+          cached.price === tile.price &&
+          cached.currency === tile.currency &&
+          cached.briefHash === hash &&
+          cached.description === description
+        ) {
+          freeBadges.push(badgeFor(cached));
+          continue;
+        }
+        const reason = localReasonFor(tile, normalized);
+        if (reason !== null) {
+          const judgment = this.localJudgment(id, tile, reason, hash);
+          this.storeLocal(judgment);
+          freeBadges.push(badgeFor(judgment));
+        } else {
+          openedSurvivors.push({
+            id,
+            title: tile.title,
+            price: tile.price,
+            currency: tile.currency,
+            place: tile.place,
+            description,
+          });
+        }
+        continue;
+      }
+      const described = this.describedFor(id);
+      if (
+        described !== undefined &&
+        described.price === tile.price &&
+        described.currency === tile.currency &&
+        described.briefHash === hash
+      ) {
+        freeBadges.push(badgeFor(described));
+        continue;
+      }
+      const cached = this.gridFor(id);
       if (
         cached !== undefined &&
         cached.price === tile.price &&
@@ -607,21 +674,8 @@ export class MarketplaceSession {
       }
       const reason = localReasonFor(tile, normalized);
       if (reason !== null) {
-        const judgment: Judgment = {
-          id,
-          title: tile.title,
-          verdict: 'SKIP',
-          fit: null,
-          fitConfidence: null,
-          dealbreaker: null,
-          reason,
-          ms: null,
-          price: tile.price,
-          currency: tile.currency,
-          place: tile.place,
-          briefHash: hash,
-        };
-        this.judgments.set(id, judgment);
+        const judgment = this.localJudgment(id, tile, reason, hash);
+        this.storeLocal(judgment);
         freeBadges.push(badgeFor(judgment));
       } else {
         survivors.push({
@@ -665,27 +719,244 @@ export class MarketplaceSession {
           unpainted.push(listing.id);
           continue;
         }
-        const judgment: Judgment = {
-          id: listing.id,
-          title: listing.title,
-          verdict: decideVerdict(answers.fit, answers.confidence, answers.dealbreaker),
-          fit: answers.fit,
-          fitConfidence: answers.confidence,
-          dealbreaker: answers.dealbreaker,
-          reason: null,
-          ms: result.ms,
-          price: listing.price,
-          currency: listing.currency,
-          place: listing.place,
-          briefHash: hash,
-        };
-        this.judgments.set(listing.id, judgment);
+        const judgment = this.modelJudgment(listing, answers, result.ms, hash, false, null);
+        this.storeGrid(judgment);
         badges.push(badgeFor(judgment));
       }
+    }
+    for (const listing of openedSurvivors) {
+      const single = await this.sendOpened(normalized, listing, hash);
+      badges.push(...single.badges);
+      unpainted.push(...single.unpainted);
+      waveError ??= single.error;
     }
     this.lastError = waveError;
 
     return { badges, unpainted, panel: this.panel('ready', null) };
+  }
+
+  // Judges listings the shopper opened, each as its own request with the
+  // description. A grid judgment never satisfies an open; a later open with
+  // the same item, price, currency, brief, and description reuses the
+  // described judgment. A local SKIP is never sent.
+  async judgeOpened(
+    brief: Brief,
+    snapshotOrSnapshots: TileSnapshot | TileSnapshot[],
+    keyPresent: boolean,
+  ): Promise<WaveResult> {
+    const snapshots = Array.isArray(snapshotOrSnapshots)
+      ? snapshotOrSnapshots
+      : [snapshotOrSnapshots];
+    const normalized = normalizeBrief(brief);
+    if (normalized.query.trim() === '') {
+      return {
+        badges: [],
+        unpainted: [],
+        panel: this.panel('need-query', NEED_QUERY_NOTICE),
+      };
+    }
+    const hash = briefHash(normalized);
+    if (this.briefHash !== hash) {
+      this.judgments.clear();
+      this.briefHash = hash;
+    }
+    const considered = snapshots.filter(
+      (snapshot) => itemId(snapshot.href) !== null,
+    );
+    this.scanned += considered.length;
+
+    const parsed = new Map<string, ParsedTile>();
+    const descriptions = new Map<string, string>();
+    const order: string[] = [];
+    for (const snapshot of considered) {
+      const id = itemId(snapshot.href) as string;
+      if (!parsed.has(id)) {
+        parsed.set(id, parseTile(snapshot.name, normalized.currency));
+        descriptions.set(id, snapshot.description ?? '');
+        order.push(id);
+      }
+    }
+    const freeBadges: Badge[] = [];
+    const survivors: ListingState[] = [];
+    for (const id of order) {
+      const tile = parsed.get(id)!;
+      const description = descriptions.get(id) ?? '';
+      const cached = this.describedFor(id);
+      if (
+        cached !== undefined &&
+        cached.price === tile.price &&
+        cached.currency === tile.currency &&
+        cached.briefHash === hash &&
+        cached.description === description
+      ) {
+        freeBadges.push(badgeFor(cached));
+        continue;
+      }
+      const reason = localReasonFor(tile, normalized);
+      if (reason !== null) {
+        const judgment = this.localJudgment(id, tile, reason, hash);
+        this.storeLocal(judgment);
+        freeBadges.push(badgeFor(judgment));
+      } else {
+        survivors.push({
+          id,
+          title: tile.title,
+          price: tile.price,
+          currency: tile.currency,
+          place: tile.place,
+          description,
+        });
+      }
+    }
+
+    if (!keyPresent) {
+      return {
+        badges: freeBadges,
+        unpainted: [],
+        panel: this.panel('need-key', NEED_KEY_NOTICE),
+      };
+    }
+
+    const badges: Badge[] = [...freeBadges];
+    const unpainted: string[] = [];
+    let waveError: string | null = null;
+    for (const listing of survivors) {
+      const single = await this.sendOpened(normalized, listing, hash);
+      badges.push(...single.badges);
+      unpainted.push(...single.unpainted);
+      waveError ??= single.error;
+    }
+    this.lastError = waveError;
+
+    return { badges, unpainted, panel: this.panel('ready', null) };
+  }
+
+  private gridFor(id: string): Judgment | undefined {
+    return this.judgments.get(cacheKey(id, false));
+  }
+
+  private describedFor(id: string): Judgment | undefined {
+    return this.judgments.get(cacheKey(id, true));
+  }
+
+  // Stores a grid model judgment. A stale described entry (different price,
+  // currency, or brief) drops; a current one stays and keeps winning.
+  private storeGrid(judgment: Judgment): void {
+    this.judgments.set(cacheKey(judgment.id, false), judgment);
+    const described = this.describedFor(judgment.id);
+    if (
+      described !== undefined &&
+      (described.price !== judgment.price ||
+        described.currency !== judgment.currency ||
+        described.briefHash !== judgment.briefHash)
+    ) {
+      this.judgments.delete(cacheKey(judgment.id, true));
+    }
+  }
+
+  // Stores a described judgment. A stale grid entry drops; a current one
+  // stays beside it with the described entry winning on screen.
+  private storeDescribed(judgment: Judgment): void {
+    this.judgments.set(cacheKey(judgment.id, true), judgment);
+    const grid = this.gridFor(judgment.id);
+    if (
+      grid !== undefined &&
+      (grid.price !== judgment.price ||
+        grid.currency !== judgment.currency ||
+        grid.briefHash !== judgment.briefHash)
+    ) {
+      this.judgments.delete(cacheKey(judgment.id, false));
+    }
+  }
+
+  // A local SKIP always wins for its item: it overwrites the grid slot and
+  // clears any described entry, so a stale model verdict cannot resurface.
+  private storeLocal(judgment: Judgment): void {
+    this.judgments.set(cacheKey(judgment.id, false), judgment);
+    this.judgments.delete(cacheKey(judgment.id, true));
+  }
+
+  private localJudgment(
+    id: string,
+    tile: ParsedTile,
+    reason: LocalReason,
+    hash: string,
+  ): Judgment {
+    return {
+      id,
+      title: tile.title,
+      verdict: 'SKIP',
+      fit: null,
+      fitConfidence: null,
+      dealbreaker: null,
+      reason,
+      ms: null,
+      price: tile.price,
+      currency: tile.currency,
+      place: tile.place,
+      briefHash: hash,
+      described: false,
+      description: null,
+    };
+  }
+
+  private modelJudgment(
+    listing: ListingState,
+    answers: { fit: number; confidence: number; dealbreaker: number },
+    ms: number,
+    hash: string,
+    described: boolean,
+    description: string | null,
+  ): Judgment {
+    return {
+      id: listing.id,
+      title: listing.title,
+      verdict: decideVerdict(answers.fit, answers.confidence, answers.dealbreaker),
+      fit: answers.fit,
+      fitConfidence: answers.confidence,
+      dealbreaker: answers.dealbreaker,
+      reason: null,
+      ms,
+      price: listing.price,
+      currency: listing.currency,
+      place: listing.place,
+      briefHash: hash,
+      described,
+      description,
+    };
+  }
+
+  // One request for one opened listing. Failures and omitted answers leave
+  // the listing unpainted without clearing the grid judgment beside it.
+  private async sendOpened(
+    brief: NormalizedBrief,
+    listing: ListingState,
+    hash: string,
+  ): Promise<{ badges: Badge[]; unpainted: string[]; error: string | null }> {
+    const result = await this.gateway.send(this.requestFor(brief, [listing]));
+    this.lastMs = result.ms;
+    if (!result.ok) {
+      return { badges: [], unpainted: [listing.id], error: result.error };
+    }
+    this.totalCost += result.cost;
+    const answers = parseAnswers(result.answers, listing.id);
+    if (answers === null) {
+      return {
+        badges: [],
+        unpainted: [listing.id],
+        error: `Jev omitted the answers for listing ${listing.id}.`,
+      };
+    }
+    const judgment = this.modelJudgment(
+      listing,
+      answers,
+      result.ms,
+      hash,
+      true,
+      listing.description ?? '',
+    );
+    this.storeDescribed(judgment);
+    return { badges: [badgeFor(judgment)], unpainted: [], error: null };
   }
 
   private requestFor(brief: NormalizedBrief, chunk: ListingState[]): DecisionRequest {
@@ -714,8 +985,20 @@ export class MarketplaceSession {
     };
   }
 
+  // One entry per item id; the described judgment wins when both exist.
+  private preferred(): Judgment[] {
+    const byId = new Map<string, Judgment>();
+    for (const judgment of this.judgments.values()) {
+      const existing = byId.get(judgment.id);
+      if (existing === undefined || (judgment.described && !existing.described)) {
+        byId.set(judgment.id, judgment);
+      }
+    }
+    return [...byId.values()];
+  }
+
   private panel(status: PanelStatus, notice: string | null): PanelModel {
-    const entries = [...this.judgments.values()]
+    const entries = this.preferred()
       .map((judgment) => ({
         id: judgment.id,
         title: judgment.title,

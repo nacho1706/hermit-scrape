@@ -1218,3 +1218,196 @@ describe('marketplace session score cache (#4)', () => {
     expect(second.panel.totalCost).toBeCloseTo(first.panel.totalCost, 6);
   });
 });
+
+describe('marketplace session opened listings (#5)', () => {
+  const tile = (id: string, name: string, description?: string) => ({
+    href: `https://www.facebook.com/marketplace/item/${id}/`,
+    name,
+    ...(description === undefined ? {} : { description }),
+  });
+
+  // Grid calls score MATCH; opened calls with a description score REVIEW.
+  // Different ms/cost per path prove the described verdict replaces the grid
+  // badge together with its timing.
+  const gridThenDescribed = () =>
+    new ScriptedGateway((request) => {
+      const listing = request.state.listings[0]!;
+      const described = (listing as { description?: unknown }).description !== undefined;
+      const scripted = described
+        ? { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 }
+        : { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 };
+      const answers: Record<string, AnswerValue> = {};
+      for (const question of request.questions) {
+        answers[question.name] =
+          question.kind === 'score'
+            ? { kind: 'score', value: scripted.fit, confidence: scripted.confidence }
+            : { kind: 'noul', probabilityTrue: scripted.dealbreaker };
+      }
+      return described
+        ? { ok: true, answers, ms: 210, cost: 0.002 }
+        : { ok: true, answers, ms: 120, cost: 0.001 };
+    });
+
+  it('sends an opened survivor as one request with the description, replacing the grid badge', async () => {
+    const gateway = gridThenDescribed();
+    const session = new MarketplaceSession(gateway);
+    const brief = {
+      query: 'iPhone 13',
+      maxPrice: 300000,
+      currency: 'ARS' as const,
+      note: 'Must be unlocked.',
+    };
+    const name = 'iPhone 13 128GB, $ 250.000, Palermo';
+    const description = 'Cracked back glass, battery at 78%, comes with box.';
+
+    const grid = await session.judgeWave(brief, [tile('501', name)], true);
+    expect(gateway.requests).toHaveLength(1);
+    expect(grid.badges).toEqual([{ id: '501', text: 'MATCH 2.6', tone: 'match' }]);
+
+    // A stored grid judgment does not satisfy the open: it sends again.
+    const opened = await session.judgeOpened(brief, tile('501', name, description), true);
+    expect(gateway.requests).toHaveLength(2);
+    const request = gateway.requests[1]!;
+    expect(request.model).toBe('jev-1.13');
+    expect(request.state.query).toBe('iPhone 13');
+    expect(request.state.note).toBe('Must be unlocked.');
+    expect(request.state.listings).toEqual([
+      {
+        id: '501',
+        title: 'iPhone 13 128GB',
+        price: 250000,
+        currency: 'ARS',
+        place: 'Palermo',
+        description,
+      },
+    ]);
+    expect(request.questions).toHaveLength(2);
+    expect(request.questions.every((question) => question.name.includes('501'))).toBe(true);
+
+    // The described verdict replaces the grid badge on the tile and panel.
+    expect(opened.badges).toEqual([{ id: '501', text: 'REVIEW 1.5', tone: 'review' }]);
+    expect(opened.unpainted).toEqual([]);
+    expect(opened.panel.entries).toEqual([
+      { id: '501', title: 'iPhone 13 128GB', verdict: 'REVIEW', fit: 1.5, reason: null },
+    ]);
+    expect(opened.panel.kept).toBe(0);
+    expect(opened.panel.review).toBe(1);
+    expect(opened.panel.lastMs).toBe(210);
+    expect(opened.panel.totalCost).toBeCloseTo(0.003, 6);
+
+    // Fit, confidence, dealbreaker, and ms update together on the described
+    // judgment, which is the one the panel keeps for the item.
+    const kept = session
+      .snapshot()
+      .judgments.find((judgment) => judgment.id === '501' && judgment.described);
+    expect(kept).toMatchObject({
+      verdict: 'REVIEW',
+      fit: 1.5,
+      fitConfidence: 0.9,
+      dealbreaker: 0.1,
+      ms: 210,
+      description,
+    });
+  });
+
+  it('reuses the described judgment on a second open and prefers it on the grid', async () => {
+    const gateway = gridThenDescribed();
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone 13' };
+    const name = 'iPhone 13 128GB, Palermo';
+    const description = 'Full box, battery replaced last year.';
+
+    await session.judgeWave(brief, [tile('502', name)], true);
+    const first = await session.judgeOpened(brief, tile('502', name, description), true);
+    expect(gateway.requests).toHaveLength(2);
+    expect(first.badges).toEqual([{ id: '502', text: 'REVIEW 1.5', tone: 'review' }]);
+
+    // Same item, price, currency, brief, and description: no second payment.
+    const second = await session.judgeOpened(brief, tile('502', name, description), true);
+    expect(gateway.requests).toHaveLength(2);
+    expect(second.badges).toEqual(first.badges);
+    expect(second.unpainted).toEqual([]);
+    expect(second.panel.lastMs).toBe(210);
+    expect(second.panel.totalCost).toBeCloseTo(first.panel.totalCost, 6);
+
+    // With both stored, the grid repaints the described judgment, unsent.
+    const grid = await session.judgeWave(brief, [tile('502', name)], true);
+    expect(gateway.requests).toHaveLength(2);
+    expect(grid.badges).toEqual([{ id: '502', text: 'REVIEW 1.5', tone: 'review' }]);
+    expect(grid.panel.entries).toEqual([
+      { id: '502', title: 'iPhone 13 128GB', verdict: 'REVIEW', fit: 1.5, reason: null },
+    ]);
+
+    // The described judgment survives a reload in the same browser session.
+    const afterGateway = gridThenDescribed();
+    const reloaded = new MarketplaceSession(afterGateway, session.snapshot());
+    const reopened = await reloaded.judgeOpened(brief, tile('502', name, description), true);
+    expect(afterGateway.requests).toHaveLength(0);
+    expect(reopened.badges).toEqual([{ id: '502', text: 'REVIEW 1.5', tone: 'review' }]);
+  });
+
+  it('keeps a local SKIP unsent when opened with a description', async () => {
+    const gateway = new ScriptedGateway(() => ok());
+    const session = new MarketplaceSession(gateway);
+    const brief = { query: 'iPhone', maxPrice: 200000, currency: 'ARS' as const };
+    const name = 'iPhone 13 128GB, $ 250.000, Palermo';
+    const description = 'Mint condition, but over budget.';
+
+    const grid = await session.judgeWave(brief, [tile('601', name)], true);
+    expect(gateway.requests).toHaveLength(0);
+    expect(grid.badges).toEqual([{ id: '601', text: 'SKIP price', tone: 'skip' }]);
+
+    const opened = await session.judgeOpened(brief, tile('601', name, description), true);
+    expect(gateway.requests).toHaveLength(0);
+    expect(opened.badges).toEqual([{ id: '601', text: 'SKIP price', tone: 'skip' }]);
+    expect(opened.unpainted).toEqual([]);
+    expect(opened.panel.entries).toEqual([
+      { id: '601', title: 'iPhone 13 128GB', verdict: 'SKIP', fit: null, reason: 'price' },
+    ]);
+
+    // Never gridded: a direct open of a local SKIP still sends nothing.
+    const fresh = new MarketplaceSession(gateway);
+    const direct = await fresh.judgeOpened(brief, tile('602', name, description), true);
+    expect(gateway.requests).toHaveLength(0);
+    expect(direct.badges).toEqual([{ id: '602', text: 'SKIP price', tone: 'skip' }]);
+  });
+
+  it('does not fold opened listings into grid chunks in a mixed wave', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({
+        '701': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 },
+        '702': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 },
+        '703': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 },
+      }),
+    );
+    const session = new MarketplaceSession(gateway);
+
+    const result = await session.judgeWave(
+      { query: 'lamp' },
+      [
+        tile('701', 'Lamp 701, Palermo'),
+        tile('702', 'Lamp 702, Palermo'),
+        tile('703', 'Lamp 703, Palermo', 'Seller notes a small scratch.'),
+      ],
+      true,
+    );
+
+    expect(gateway.requests).toHaveLength(2);
+    const [gridChunk, openedSingle] = gateway.requests as [DecisionRequest, DecisionRequest];
+    expect(gridChunk.state.listings.map((listing) => listing.id)).toEqual(['701', '702']);
+    expect(gridChunk.questions).toHaveLength(4);
+    expect(openedSingle.state.listings).toEqual([
+      {
+        id: '703',
+        title: 'Lamp 703',
+        price: null,
+        currency: null,
+        place: 'Palermo',
+        description: 'Seller notes a small scratch.',
+      },
+    ]);
+    expect(openedSingle.questions).toHaveLength(2);
+    expect(result.badges).toHaveLength(3);
+    expect(result.unpainted).toEqual([]);
+  });
+});
