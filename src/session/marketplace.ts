@@ -1,12 +1,25 @@
-// Behavioral core for the Deal Hunter grid slice (#2).
+// Behavioral core for the Deal Hunter grid slices (#2, #3).
 //
 // The marketplace session decides verdicts. Adapters (tile reader, Jev gateway,
 // grid painter, side panel, stores) surround it and are not covered by tests.
 // Tests script the gateway, so nothing here touches the DOM or the network.
+//
+// Brief fields beyond the query are optional so older callers and stored
+// briefs keep working; missing values normalize to no cap, ARS, no places,
+// and an empty note. Price is null when the tile shows no number; currency
+// is null alongside a missing price.
+
+export type BriefCurrency = 'ARS' | 'USD';
 
 export interface Brief {
   query: string;
+  maxPrice?: number | null;
+  currency?: BriefCurrency;
+  places?: string[];
+  note?: string;
 }
+
+export type LocalReason = 'price' | 'no price' | 'currency' | 'location';
 
 export interface TileSnapshot {
   href: string;
@@ -16,6 +29,9 @@ export interface TileSnapshot {
 export interface ListingState {
   id: string;
   title: string;
+  price: number | null;
+  currency: string | null;
+  place: string;
 }
 
 export interface ScoreQuestion {
@@ -82,7 +98,9 @@ export interface PanelEntry {
   id: string;
   title: string;
   verdict: Verdict;
-  fit: number;
+  // Null for a local SKIP, which carries a reason and no model scores.
+  fit: number | null;
+  reason: LocalReason | null;
 }
 
 export type PanelStatus = 'ready' | 'need-query' | 'need-key';
@@ -142,6 +160,220 @@ export function itemId(href: string): string | null {
   return match?.[1] ?? null;
 }
 
+interface NormalizedBrief {
+  query: string;
+  maxPrice: number | null;
+  currency: BriefCurrency;
+  places: string[];
+  note: string;
+}
+
+function normalizeBrief(brief: Brief): NormalizedBrief {
+  return {
+    query: brief.query,
+    maxPrice: brief.maxPrice ?? null,
+    currency: brief.currency ?? 'ARS',
+    places: brief.places ?? [],
+    note: brief.note ?? '',
+  };
+}
+
+interface ParsedTile {
+  title: string;
+  price: number | null;
+  currency: string | null;
+  place: string;
+}
+
+const FREE_PATTERN = /\b(free|gratis)\b/i;
+
+// Symbol prefixes before the amount. Longer markers come first so `US$`
+// wins over a bare `$`.
+const SYMBOL_PREFIX_PATTERN = /US\$|U\$S|R\$|MX\$|\$|€|£/y;
+const CODE_PATTERN =
+  /USD|ARS|EUR|GBP|BRL|CLP|COP|MXN|PEN|UYU|PYG|BOB|CAD|AUD|CHF|Bs/i;
+const LISTING_ID_SUFFIX_PATTERN =
+  /,?\s*\b(listing\s*(id)?|item\s*(id)?|id)\s*#?:?\s*\d+\s*$/i;
+
+function canonicalCurrency(marker: string, briefCurrency: BriefCurrency): string {
+  const upper = marker.toUpperCase();
+  if (marker === '$') return briefCurrency;
+  if (upper === 'US$' || upper === 'U$S' || upper === 'USD') return 'USD';
+  if (upper === 'ARS') return 'ARS';
+  return upper;
+}
+
+// Thousand separators read as one integer (`250.000` is 250000); a trailing
+// separator with one or two digits is a decimal (`1.234,56` is 1234.56).
+// Exported for the side panel's max-price input, which reads the same way.
+export function parseAmount(raw: string): number {
+  const compact = raw.replace(/\s+/g, '').replace(/[.,]+$/, '');
+  const trailing = /[.,](\d{1,2})$/.exec(compact);
+  if (trailing?.[1] !== undefined) {
+    const head = compact.slice(0, compact.length - trailing[0].length);
+    return parseFloat(`${head.replace(/[.,]/g, '')}.${trailing[1]}`);
+  }
+  return parseInt(compact.replace(/[.,]/g, ''), 10);
+}
+
+interface PriceCandidate {
+  amount: number;
+  currency: string;
+  start: number;
+  end: number;
+}
+
+function scanExplicitPrices(
+  name: string,
+  briefCurrency: BriefCurrency,
+): PriceCandidate[] {
+  const candidates: PriceCandidate[] = [];
+  // Amounts start and end with a digit so a scan never eats the comma that
+  // separates the price segment from the place.
+  const amount = '\\d(?:[\\d.,]*\\d)?';
+  // Symbol prefix: `$ 250.000`, `US$ 200`.
+  const symbolPattern = new RegExp(
+    `(${SYMBOL_PREFIX_PATTERN.source})\\s*(${amount})`,
+    'gi',
+  );
+  for (const match of name.matchAll(symbolPattern)) {
+    const marker = match[1] ?? '';
+    const raw = match[2] ?? '';
+    const start = match.index ?? 0;
+    candidates.push({
+      amount: parseAmount(raw),
+      currency: canonicalCurrency(marker, briefCurrency),
+      start,
+      end: start + match[0].length,
+    });
+  }
+  // Letter code before or after the amount: `USD 200`, `200 ARS`.
+  const codePattern = new RegExp(
+    `(?:(${CODE_PATTERN.source})\\s*(${amount})|(${amount})\\s*(${CODE_PATTERN.source}))\\b`,
+    'gi',
+  );
+  for (const match of name.matchAll(codePattern)) {
+    const marker = (match[1] ?? match[4] ?? '').toUpperCase();
+    const raw = match[2] ?? match[3] ?? '';
+    // A bare `$` already covered above; skip code matches that overlap one.
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    if (candidates.some((c) => start < c.end && end > c.start)) continue;
+    candidates.push({
+      amount: parseAmount(raw),
+      currency: canonicalCurrency(marker, briefCurrency),
+      start,
+      end,
+    });
+  }
+  return candidates.sort((a, b) => a.start - b.start);
+}
+
+function scanBareSegmentPrice(segment: string): number | null {
+  const trimmed = segment.trim();
+  if (trimmed === '') return null;
+  // Only a bare number (or range) standing alone as its own segment counts;
+  // title words with digits such as `iPhone 13` never do.
+  if (!/^\d[\d.,\s]*(?:\s*[-–—]\s*\d[\d.,\s]*)?$/.test(trimmed)) return null;
+  const parts = trimmed.split(/\s*[-–—]\s*/);
+  const amounts = parts.map((part) => parseAmount(part));
+  return Math.min(...amounts);
+}
+
+function removeSpan(name: string, start: number, end: number): string {
+  return `${name.slice(0, start)} ${name.slice(end)}`;
+}
+
+function parseTile(name: string, briefCurrency: BriefCurrency): ParsedTile {
+  let working = name;
+  let price: number | null = null;
+  let currency: string | null = null;
+
+  // An explicit number beats the words: `free shipping` next to a real price
+  // is not the price.
+  const explicit = scanExplicitPrices(working, briefCurrency);
+  const freeMatch = explicit.length === 0 ? FREE_PATTERN.exec(working) : null;
+  if (freeMatch?.index !== undefined) {
+    price = 0;
+    currency = briefCurrency;
+    working = removeSpan(working, freeMatch.index, freeMatch.index + freeMatch[0].length);
+  } else if (explicit.length > 0) {
+    // A range judges its lower amount. A bare partner next to an explicit
+    // price (`$100-200`) joins the range under the explicit currency.
+    const amounts = explicit.map((c) => c.amount);
+    let start = explicit[0]!.start;
+    let end = explicit[explicit.length - 1]!.end;
+    const before = working.slice(0, start);
+    const beforeMatch = /(\d(?:[\d.,]*\d)?)\s*[-–—]\s*$/.exec(before);
+    if (beforeMatch?.[1] !== undefined) {
+      amounts.push(parseAmount(beforeMatch[1]));
+      start -= beforeMatch[0].length;
+    }
+    const after = working.slice(end);
+    const afterMatch = /^\s*[-–—]\s*(\d(?:[\d.,]*\d)?)/.exec(after);
+    if (afterMatch?.[1] !== undefined) {
+      amounts.push(parseAmount(afterMatch[1]));
+      end += afterMatch[0].length;
+    }
+    const first = explicit[0]!;
+    price = Math.min(...amounts);
+    currency = first.currency;
+    working = removeSpan(working, start, end);
+  } else {
+    for (const segment of working.split(',')) {
+      const bare = scanBareSegmentPrice(segment);
+      if (bare !== null) {
+        price = bare;
+        currency = briefCurrency;
+        const at = working.indexOf(segment);
+        working = removeSpan(working, at, at + segment.length);
+        break;
+      }
+    }
+  }
+
+  working = working.replace(LISTING_ID_SUFFIX_PATTERN, '');
+  const segments = working
+    .split(',')
+    .map((segment) => segment.replace(/\s+/g, ' ').trim())
+    .filter((segment) => segment !== '');
+  if (segments.length === 0) return { title: '', price, currency, place: '' };
+  if (segments.length === 1) {
+    return { title: segments[0]!, price, currency, place: '' };
+  }
+  return {
+    title: segments.slice(0, -1).join(', '),
+    price,
+    currency,
+    place: segments[segments.length - 1]!,
+  };
+}
+
+function localReasonFor(
+  parsed: ParsedTile,
+  brief: NormalizedBrief,
+): LocalReason | null {
+  // Currency first: without a shared unit there is no meaningful cap check,
+  // and there is no exchange rate.
+  if (parsed.currency !== null && parsed.currency !== brief.currency) {
+    return 'currency';
+  }
+  if (parsed.price === null) {
+    if (brief.maxPrice !== null) return 'no price';
+  } else if (brief.maxPrice !== null && parsed.price > brief.maxPrice) {
+    return 'price';
+  }
+  const wanted = brief.places.map((place) => place.trim()).filter((p) => p !== '');
+  if (wanted.length > 0) {
+    const place = parsed.place.toLowerCase();
+    const hit =
+      place !== '' &&
+      wanted.some((sub) => place.includes(sub.toLowerCase()));
+    if (!hit) return 'location';
+  }
+  return null;
+}
+
 function fitQuestionName(id: string): string {
   return `fit-${id}`;
 }
@@ -166,10 +398,15 @@ interface Judgment {
   id: string;
   title: string;
   verdict: Verdict;
-  fit: number;
-  fitConfidence: number;
-  dealbreaker: number;
-  ms: number;
+  // Model scores are null on a local SKIP, which carries a reason instead.
+  fit: number | null;
+  fitConfidence: number | null;
+  dealbreaker: number | null;
+  reason: LocalReason | null;
+  ms: number | null;
+  price: number | null;
+  currency: string | null;
+  place: string;
 }
 
 interface ParsedAnswers {
@@ -201,9 +438,12 @@ function parseAnswers(
 }
 
 function badgeFor(judgment: Judgment): Badge {
+  if (judgment.reason !== null) {
+    return { id: judgment.id, text: `SKIP ${judgment.reason}`, tone: 'skip' };
+  }
   return {
     id: judgment.id,
-    text: `${judgment.verdict} ${judgment.fit.toFixed(1)}`,
+    text: `${judgment.verdict} ${(judgment.fit ?? 0).toFixed(1)}`,
     tone: judgment.verdict.toLowerCase() as BadgeTone,
   };
 }
@@ -215,9 +455,11 @@ const VERDICT_RANK: Record<Verdict, number> = {
 };
 
 function compareEntries(a: PanelEntry, b: PanelEntry): number {
-  return (
-    VERDICT_RANK[a.verdict] - VERDICT_RANK[b.verdict] || b.fit - a.fit
-  );
+  if (VERDICT_RANK[a.verdict] !== VERDICT_RANK[b.verdict]) {
+    return VERDICT_RANK[a.verdict] - VERDICT_RANK[b.verdict];
+  }
+  // Higher fit first; a local SKIP (no fit) follows model SKIP entries.
+  return (b.fit ?? -1) - (a.fit ?? -1);
 }
 
 export class MarketplaceSession {
@@ -246,7 +488,8 @@ export class MarketplaceSession {
     snapshots: TileSnapshot[],
     keyPresent: boolean,
   ): Promise<WaveResult> {
-    if (brief.query.trim() === '') {
+    const normalized = normalizeBrief(brief);
+    if (normalized.query.trim() === '') {
       return {
         badges: [],
         unpainted: [],
@@ -257,29 +500,68 @@ export class MarketplaceSession {
       (snapshot) => itemId(snapshot.href) !== null,
     );
     this.scanned += considered.length;
+
+    // Parse once per item id; repeated tiles of one item share the first
+    // snapshot. Hard limits split local SKIP badges from Jev survivors.
+    // The product query is model context only, never a title word match.
+    const parsed = new Map<string, ParsedTile>();
+    const order: string[] = [];
+    for (const snapshot of considered) {
+      const id = itemId(snapshot.href) as string;
+      if (!parsed.has(id)) {
+        parsed.set(id, parseTile(snapshot.name, normalized.currency));
+        order.push(id);
+      }
+    }
+    const localBadges: Badge[] = [];
+    const survivors: ListingState[] = [];
+    for (const id of order) {
+      const tile = parsed.get(id)!;
+      const reason = localReasonFor(tile, normalized);
+      if (reason !== null) {
+        const judgment: Judgment = {
+          id,
+          title: tile.title,
+          verdict: 'SKIP',
+          fit: null,
+          fitConfidence: null,
+          dealbreaker: null,
+          reason,
+          ms: null,
+          price: tile.price,
+          currency: tile.currency,
+          place: tile.place,
+        };
+        this.judgments.set(id, judgment);
+        localBadges.push(badgeFor(judgment));
+      } else {
+        survivors.push({
+          id,
+          title: tile.title,
+          price: tile.price,
+          currency: tile.currency,
+          place: tile.place,
+        });
+      }
+    }
+
+    // Local rejects paint without a key; survivors wait for one. Survivors
+    // stay out of `unpainted` so the content script retries them once a key
+    // (or query) unlocks the wave.
     if (!keyPresent) {
       return {
-        badges: [],
+        badges: localBadges,
         unpainted: [],
         panel: this.panel('need-key', NEED_KEY_NOTICE),
       };
     }
 
-    const targets = new Map<string, ListingState>();
-    for (const snapshot of considered) {
-      const id = itemId(snapshot.href) as string;
-      if (!targets.has(id)) {
-        targets.set(id, { id, title: snapshot.name });
-      }
-    }
-
-    const badges: Badge[] = [];
+    const badges: Badge[] = [...localBadges];
     const unpainted: string[] = [];
     let waveError: string | null = null;
-    const listings = [...targets.values()];
-    for (let start = 0; start < listings.length; start += CHUNK_SIZE) {
-      const chunk = listings.slice(start, start + CHUNK_SIZE);
-      const result = await this.gateway.send(this.requestFor(brief, chunk));
+    for (let start = 0; start < survivors.length; start += CHUNK_SIZE) {
+      const chunk = survivors.slice(start, start + CHUNK_SIZE);
+      const result = await this.gateway.send(this.requestFor(normalized, chunk));
       this.lastMs = result.ms;
       if (!result.ok) {
         waveError ??= result.error;
@@ -288,8 +570,8 @@ export class MarketplaceSession {
       }
       this.totalCost += result.cost;
       for (const listing of chunk) {
-        const parsed = parseAnswers(result.answers, listing.id);
-        if (parsed === null) {
+        const answers = parseAnswers(result.answers, listing.id);
+        if (answers === null) {
           waveError ??= `Jev omitted the answers for listing ${listing.id}.`;
           unpainted.push(listing.id);
           continue;
@@ -297,11 +579,15 @@ export class MarketplaceSession {
         const judgment: Judgment = {
           id: listing.id,
           title: listing.title,
-          verdict: decideVerdict(parsed.fit, parsed.confidence, parsed.dealbreaker),
-          fit: parsed.fit,
-          fitConfidence: parsed.confidence,
-          dealbreaker: parsed.dealbreaker,
+          verdict: decideVerdict(answers.fit, answers.confidence, answers.dealbreaker),
+          fit: answers.fit,
+          fitConfidence: answers.confidence,
+          dealbreaker: answers.dealbreaker,
+          reason: null,
           ms: result.ms,
+          price: listing.price,
+          currency: listing.currency,
+          place: listing.place,
         };
         this.judgments.set(listing.id, judgment);
         badges.push(badgeFor(judgment));
@@ -312,7 +598,7 @@ export class MarketplaceSession {
     return { badges, unpainted, panel: this.panel('ready', null) };
   }
 
-  private requestFor(brief: Brief, chunk: ListingState[]): DecisionRequest {
+  private requestFor(brief: NormalizedBrief, chunk: ListingState[]): DecisionRequest {
     const questions: DecisionQuestion[] = [];
     for (const listing of chunk) {
       questions.push(
@@ -333,7 +619,7 @@ export class MarketplaceSession {
     }
     return {
       model: MODEL_ID,
-      state: { query: brief.query, note: '', listings: chunk },
+      state: { query: brief.query, note: brief.note, listings: chunk },
       questions,
     };
   }
@@ -345,6 +631,7 @@ export class MarketplaceSession {
         title: judgment.title,
         verdict: judgment.verdict,
         fit: judgment.fit,
+        reason: judgment.reason,
       }))
       .sort(compareEntries);
     return {

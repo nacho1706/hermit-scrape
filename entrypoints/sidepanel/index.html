@@ -24,11 +24,26 @@
         font-weight: 600;
         margin-bottom: 4px;
       }
-      #query {
+      #query,
+      #max-price,
+      #places,
+      #note,
+      #currency {
         width: 100%;
         box-sizing: border-box;
         padding: 6px 8px;
         font: inherit;
+      }
+      #note {
+        resize: vertical;
+        min-height: 44px;
+      }
+      .row {
+        display: flex;
+        gap: 8px;
+      }
+      .row > div {
+        flex: 1;
       }
       #notice {
         padding: 8px;
@@ -104,6 +119,27 @@
       <div>
         <label for="query">Product query</label>
         <input id="query" type="text" placeholder="e.g. iPhone 13 128GB" autocomplete="off" />
+      </div>
+      <div class="row">
+        <div>
+          <label for="max-price">Max price (optional)</label>
+          <input id="max-price" type="text" inputmode="decimal" placeholder="No cap" autocomplete="off" />
+        </div>
+        <div>
+          <label for="currency">Currency</label>
+          <select id="currency">
+            <option value="ARS">ARS</option>
+            <option value="USD">USD</option>
+          </select>
+        </div>
+      </div>
+      <div>
+        <label for="places">Places (optional)</label>
+        <input id="places" type="text" placeholder="e.g. Palermo, Belgrano" autocomplete="off" />
+      </div>
+      <div>
+        <label for="note">Note (optional)</label>
+        <textarea id="note" placeholder="Condition, dealbreakers, must-haves"></textarea>
       </div>
       <div id="notice" role="status"></div>
       <dl class="stats">

@@ -1,6 +1,8 @@
 import { browser } from 'wxt/browser';
 import type { PanelModel, Verdict } from '../../src/session/marketplace';
+import { parseAmount } from '../../src/session/marketplace';
 import { briefStore } from '../../src/stores/brief';
+import type { BriefState } from '../../src/stores/brief';
 import { GET_VIEW, isViewUpdated } from '../../src/messaging';
 import type { ViewPayload } from '../../src/messaging';
 
@@ -8,6 +10,10 @@ import type { ViewPayload } from '../../src/messaging';
 // It renders what the content script's session reports. The key never
 // appears here.
 const queryInput = document.querySelector<HTMLInputElement>('#query')!;
+const maxPriceInput = document.querySelector<HTMLInputElement>('#max-price')!;
+const currencySelect = document.querySelector<HTMLSelectElement>('#currency')!;
+const placesInput = document.querySelector<HTMLInputElement>('#places')!;
+const noteInput = document.querySelector<HTMLTextAreaElement>('#note')!;
 const notice = document.querySelector('#notice')!;
 const entriesList = document.querySelector('#entries')!;
 const emptyState = document.querySelector('#empty')!;
@@ -23,13 +29,58 @@ const stats: Record<string, HTMLElement> = {
 let tabId: number | null = null;
 let saveTimer: ReturnType<typeof setTimeout> | null = null;
 
-queryInput.addEventListener('input', () => {
+function queueSave(patch: Partial<BriefState>): void {
   if (saveTimer !== null) clearTimeout(saveTimer);
   saveTimer = setTimeout(() => {
     saveTimer = null;
-    void briefStore.setValue({ query: queryInput.value });
+    void briefStore.getValue().then((current) => {
+      void briefStore.setValue({ ...current, ...patch });
+    });
   }, 300);
+}
+
+queryInput.addEventListener('input', () => {
+  queueSave({ query: queryInput.value });
 });
+
+maxPriceInput.addEventListener('input', () => {
+  queueSave({ maxPrice: readMaxPrice(maxPriceInput.value) });
+});
+
+currencySelect.addEventListener('change', () => {
+  queueSave({ currency: asCurrency(currencySelect.value) });
+});
+
+function asCurrency(value: string): 'ARS' | 'USD' {
+  return value === 'USD' ? 'USD' : 'ARS';
+}
+
+placesInput.addEventListener('input', () => {
+  queueSave({ places: readPlaces(placesInput.value) });
+});
+
+noteInput.addEventListener('input', () => {
+  queueSave({ note: noteInput.value });
+});
+
+function readMaxPrice(value: string): number | null {
+  const trimmed = value.trim();
+  if (trimmed === '') return null;
+  if (!/^\d[\d.,\s]*$/.test(trimmed)) return null;
+  const amount = parseAmount(trimmed);
+  return Number.isFinite(amount) && amount >= 0 ? amount : null;
+}
+
+function readPlaces(value: string): string[] {
+  return value
+    .split(',')
+    .map((place) => place.trim())
+    .filter((place) => place !== '');
+}
+
+function formatMaxPrice(maxPrice: number | null): string {
+  return maxPrice === null ? '' : `${maxPrice}`;
+}
 
 browser.runtime.onMessage.addListener((message: unknown, sender) => {
   if (!isViewUpdated(message)) return;
@@ -87,20 +138,33 @@ function applyNoTab(): void {
   // Never show another tab's judgments here.
   renderStats(EMPTY_PANEL);
   renderEntries(EMPTY_PANEL);
-  if (document.activeElement !== queryInput) {
-    void briefStore.getValue().then((brief) => {
-      queryInput.value = brief.query;
-    });
-  }
+  void briefStore.getValue().then((brief) => {
+    applyBrief(brief);
+  });
 }
 
 function applyView(view: ViewPayload): void {
-  if (document.activeElement !== queryInput) {
-    queryInput.value = view.brief.query;
-  }
+  applyBrief(view.brief);
   renderNotice(view.panel);
   renderStats(view.panel);
   renderEntries(view.panel);
+}
+
+function applyBrief(brief: BriefState): void {
+  setUnlessFocused(queryInput, brief.query ?? '');
+  setUnlessFocused(maxPriceInput, formatMaxPrice(brief.maxPrice ?? null));
+  setUnlessFocused(currencySelect, asCurrency(brief.currency ?? 'ARS'));
+  setUnlessFocused(placesInput, (brief.places ?? []).join(', '));
+  setUnlessFocused(noteInput, brief.note ?? '');
+}
+
+function setUnlessFocused(
+  element: HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement,
+  value: string,
+): void {
+  if (document.activeElement !== element) {
+    element.value = value;
+  }
 }
 
 function renderNotice(panel: PanelModel): void {
@@ -136,7 +200,8 @@ function renderEntries(panel: PanelModel): void {
     title.title = entry.title;
     const fit = document.createElement('span');
     fit.className = 'fit';
-    fit.textContent = entry.fit.toFixed(1);
+    // A local SKIP shows its reason and no model score.
+    fit.textContent = entry.fit === null ? (entry.reason ?? '') : entry.fit.toFixed(1);
     item.append(chip, title, fit);
     entriesList.append(item);
   }
