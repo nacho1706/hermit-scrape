@@ -1,6 +1,6 @@
 import { browser } from 'wxt/browser';
 import type { PanelModel, Verdict } from '../../src/session/marketplace';
-import { parseAmount } from '../../src/session/marketplace';
+import { parseMaxPriceInput, parsePlacesInput } from '../../src/session/marketplace';
 import { briefStore } from '../../src/stores/brief';
 import type { BriefState } from '../../src/stores/brief';
 import { GET_CSV, GET_VIEW, isCsvPayload, isViewUpdated } from '../../src/messaging';
@@ -45,7 +45,7 @@ queryInput.addEventListener('input', () => {
 });
 
 maxPriceInput.addEventListener('input', () => {
-  queueSave({ maxPrice: readMaxPrice(maxPriceInput.value) });
+  queueSave({ maxPrice: parseMaxPriceInput(maxPriceInput.value) });
 });
 
 currencySelect.addEventListener('change', () => {
@@ -57,7 +57,7 @@ function asCurrency(value: string): 'ARS' | 'USD' {
 }
 
 placesInput.addEventListener('input', () => {
-  queueSave({ places: readPlaces(placesInput.value) });
+  queueSave({ places: parsePlacesInput(placesInput.value) });
 });
 
 noteInput.addEventListener('input', () => {
@@ -87,21 +87,6 @@ async function downloadCsv(): Promise<void> {
   anchor.click();
   anchor.remove();
   setTimeout(() => URL.revokeObjectURL(url), 1000);
-}
-
-function readMaxPrice(value: string): number | null {
-  const trimmed = value.trim();
-  if (trimmed === '') return null;
-  if (!/^\d[\d.,\s]*$/.test(trimmed)) return null;
-  const amount = parseAmount(trimmed);
-  return Number.isFinite(amount) && amount >= 0 ? amount : null;
-}
-
-function readPlaces(value: string): string[] {
-  return value
-    .split(',')
-    .map((place) => place.trim())
-    .filter((place) => place !== '');
 }
 
 function formatMaxPrice(maxPrice: number | null): string {
@@ -181,7 +166,7 @@ function applyBrief(brief: BriefState): void {
   setUnlessFocused(queryInput, brief.query ?? '');
   setUnlessFocused(maxPriceInput, formatMaxPrice(brief.maxPrice ?? null));
   setUnlessFocused(currencySelect, asCurrency(brief.currency ?? 'ARS'));
-  setUnlessFocused(placesInput, (brief.places ?? []).join(', '));
+  setUnlessFocused(placesInput, (brief.places ?? []).join('; '));
   setUnlessFocused(noteInput, brief.note ?? '');
 }
 
