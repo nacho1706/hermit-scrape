@@ -39,18 +39,16 @@ export interface ListingState {
 }
 
 export interface ScoreQuestion {
-  kind: 'score';
-  name: string;
-  instruction: string;
-  levels: [string, string, string, string];
+  type: 'score';
+  instructions: string;
+  criteria: [string, string, string, string];
 }
 
 export interface NoulQuestion {
-  kind: 'noul';
-  name: string;
-  instruction: string;
-  trueCriterion: string;
-  falseCriterion: string;
+  type: 'noul';
+  instructions: string;
+  // Optional per the API; the two texts carry the reject definition.
+  criteria: { true: string; false: string };
 }
 
 export type DecisionQuestion = ScoreQuestion | NoulQuestion;
@@ -62,7 +60,8 @@ export interface DecisionRequest {
     note: string;
     listings: ListingState[];
   };
-  questions: DecisionQuestion[];
+  // Keyed by question name: the endpoint validates this field as a record.
+  questions: Record<string, DecisionQuestion>;
 }
 
 export type AnswerValue =
@@ -139,16 +138,16 @@ const LOW_CONFIDENCE_REVIEW_BELOW = 0.45;
 const FIT_MATCH_AT = 2;
 const FIT_SKIP_BELOW = 1;
 
-const FIT_INSTRUCTION =
+const FIT_INSTRUCTIONS =
   "Judge how well this listing matches the shopper's request. " +
   'Judge the product itself, and ignore whether the price is a bargain.';
-const FIT_LEVELS: [string, string, string, string] = [
+const FIT_CRITERIA: [string, string, string, string] = [
   'A different product, or a title that clearly refers to something else.',
   'Related, but the wrong model, generation, size, or a weak match.',
   'The product they asked for, and nothing in the text conflicts with the note.',
   'A clear match to the product and the note.',
 ];
-const DEALBREAKER_INSTRUCTION =
+const DEALBREAKER_INSTRUCTIONS =
   'Is there a concrete reason to reject this listing? ' +
   'Reject when the listing is broken, for parts, missing essential pieces, ' +
   'replica or scam wording, or a title that contradicts the request. ' +
@@ -1161,23 +1160,18 @@ export class MarketplaceSession {
   }
 
   private requestFor(brief: NormalizedBrief, chunk: ListingState[]): DecisionRequest {
-    const questions: DecisionQuestion[] = [];
+    const questions: Record<string, DecisionQuestion> = {};
     for (const listing of chunk) {
-      questions.push(
-        {
-          kind: 'score',
-          name: fitQuestionName(listing.id),
-          instruction: FIT_INSTRUCTION,
-          levels: FIT_LEVELS,
-        },
-        {
-          kind: 'noul',
-          name: dealbreakerQuestionName(listing.id),
-          instruction: DEALBREAKER_INSTRUCTION,
-          trueCriterion: DEALBREAKER_TRUE_CRITERION,
-          falseCriterion: DEALBREAKER_FALSE_CRITERION,
-        },
-      );
+      questions[fitQuestionName(listing.id)] = {
+        type: 'score',
+        instructions: FIT_INSTRUCTIONS,
+        criteria: FIT_CRITERIA,
+      };
+      questions[dealbreakerQuestionName(listing.id)] = {
+        type: 'noul',
+        instructions: DEALBREAKER_INSTRUCTIONS,
+        criteria: { true: DEALBREAKER_TRUE_CRITERION, false: DEALBREAKER_FALSE_CRITERION },
+      };
     }
     return {
       model: MODEL_ID,

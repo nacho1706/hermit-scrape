@@ -26,17 +26,17 @@ function answersFor(
   return (request) => {
     const ids = request.state.listings.map((listing) => listing.id);
     const answers: Record<string, AnswerValue> = {};
-    for (const question of request.questions) {
-      const id = ids.find((candidate) => question.name.includes(candidate));
+    for (const [qname, question] of Object.entries(request.questions)) {
+      const id = ids.find((candidate) => qname.includes(candidate));
       if (id === undefined) {
-        throw new Error(`question name carries no listing id: ${question.name}`);
+        throw new Error(`question name carries no listing id: ${qname}`);
       }
       const scripted = perId[id];
       if (scripted === undefined) {
         throw new Error(`no scripted answers for listing ${id}`);
       }
-      answers[question.name] =
-        question.kind === 'score'
+      answers[qname] =
+        question.type === 'score'
           ? { kind: 'score', value: scripted.fit, confidence: scripted.confidence }
           : { kind: 'noul', probabilityTrue: scripted.dealbreaker };
     }
@@ -143,34 +143,43 @@ describe('marketplace session', () => {
       { id: '202', title: 'Moto G charger cable', price: null, currency: null, place: '' },
     ]);
 
-    expect(request.questions).toHaveLength(4);
+    // The endpoint validates questions as a record keyed by question name.
+    expect(Array.isArray(request.questions)).toBe(false);
+    expect(Object.keys(request.questions).sort()).toEqual([
+      'dealbreaker-101',
+      'dealbreaker-202',
+      'fit-101',
+      'fit-202',
+    ]);
     for (const id of ['101', '202']) {
-      const named = request.questions.filter((q) => q.name.includes(id));
-      expect(named.map((q) => q.kind).sort()).toEqual(['noul', 'score']);
-      const fit = named.find((q) => q.kind === 'score')!;
-      expect(fit.kind).toBe('score');
-      if (fit.kind === 'score') {
-        expect(fit.instruction).toMatch(/how well this listing matches/i);
-        expect(fit.instruction).toMatch(/judge the product/i);
-        expect(fit.instruction).toMatch(/bargain/i);
-        expect(fit.levels).toHaveLength(4);
-        expect(fit.levels[0]).toMatch(/different product/i);
-        expect(fit.levels[1]).toMatch(/wrong model/i);
-        expect(fit.levels[2]).toMatch(/nothing in the text conflicts with the note/i);
-        expect(fit.levels[3]).toMatch(/clear match/i);
+      const named = Object.entries(request.questions)
+        .filter(([qname]) => qname.includes(id))
+        .map(([, question]) => question);
+      expect(named.map((q) => q.type).sort()).toEqual(['noul', 'score']);
+      const fit = named.find((q) => q.type === 'score')!;
+      expect(fit.type).toBe('score');
+      if (fit.type === 'score') {
+        expect(fit.instructions).toMatch(/how well this listing matches/i);
+        expect(fit.instructions).toMatch(/judge the product/i);
+        expect(fit.instructions).toMatch(/bargain/i);
+        expect(fit.criteria).toHaveLength(4);
+        expect(fit.criteria[0]).toMatch(/different product/i);
+        expect(fit.criteria[1]).toMatch(/wrong model/i);
+        expect(fit.criteria[2]).toMatch(/nothing in the text conflicts with the note/i);
+        expect(fit.criteria[3]).toMatch(/clear match/i);
       }
-      const dealbreaker = named.find((q) => q.kind === 'noul')!;
-      expect(dealbreaker.kind).toBe('noul');
-      if (dealbreaker.kind === 'noul') {
-        expect(dealbreaker.instruction).toMatch(/concrete reason to reject/i);
-        expect(dealbreaker.instruction).toMatch(/broken/i);
-        expect(dealbreaker.instruction).toMatch(/for parts/i);
-        expect(dealbreaker.instruction).toMatch(/replica/i);
-        expect(dealbreaker.instruction).toMatch(/scam/i);
-        expect(dealbreaker.instruction).toMatch(/contradicts the request/i);
-        expect(dealbreaker.instruction).toMatch(/short title with no red flag/i);
-        expect(dealbreaker.trueCriterion).toMatch(/concrete reason to reject/i);
-        expect(dealbreaker.falseCriterion).toMatch(/no concrete reject reason/i);
+      const dealbreaker = named.find((q) => q.type === 'noul')!;
+      expect(dealbreaker.type).toBe('noul');
+      if (dealbreaker.type === 'noul') {
+        expect(dealbreaker.instructions).toMatch(/concrete reason to reject/i);
+        expect(dealbreaker.instructions).toMatch(/broken/i);
+        expect(dealbreaker.instructions).toMatch(/for parts/i);
+        expect(dealbreaker.instructions).toMatch(/replica/i);
+        expect(dealbreaker.instructions).toMatch(/scam/i);
+        expect(dealbreaker.instructions).toMatch(/contradicts the request/i);
+        expect(dealbreaker.instructions).toMatch(/short title with no red flag/i);
+        expect(dealbreaker.criteria.true).toMatch(/concrete reason to reject/i);
+        expect(dealbreaker.criteria.false).toMatch(/no concrete reject reason/i);
       }
     }
 
@@ -275,10 +284,10 @@ describe('marketplace session', () => {
     const [first, second] = gateway.requests as [DecisionRequest, DecisionRequest];
     expect(first.model).toBe('jev-1.13');
     expect(first.state.listings.map((listing) => listing.id)).toEqual(ids.slice(0, 12));
-    expect(first.questions).toHaveLength(24);
+    expect(Object.keys(first.questions)).toHaveLength(24);
     expect(second.model).toBe('jev-1.13');
     expect(second.state.listings.map((listing) => listing.id)).toEqual(ids.slice(12));
-    expect(second.questions).toHaveLength(2);
+    expect(Object.keys(second.questions)).toHaveLength(2);
     expect(result.badges).toHaveLength(13);
     expect(result.unpainted).toEqual([]);
     expect(result.panel.scanned).toBe(13);
@@ -312,7 +321,7 @@ describe('marketplace session', () => {
     expect(gateway.requests[0]!.state.listings).toEqual([
       { id: '123', title: 'iPhone 13 128GB', price: null, currency: null, place: '' },
     ]);
-    expect(gateway.requests[0]!.questions).toHaveLength(2);
+    expect(Object.keys(gateway.requests[0]!.questions)).toHaveLength(2);
     expect(result.badges).toEqual([{ id: '123', text: 'MATCH 2.8', tone: 'match' }]);
     expect(result.panel.entries).toHaveLength(1);
     expect(result.panel.scanned).toBe(2);
@@ -819,8 +828,8 @@ describe('marketplace session hard limits (#3)', () => {
     expect(gateway.requests).toHaveLength(1);
     const request = gateway.requests[0]!;
     expect(request.state.listings.map((listing) => listing.id)).toEqual(['112']);
-    expect(request.questions).toHaveLength(2);
-    expect(request.questions.every((question) => question.name.includes('112'))).toBe(true);
+    expect(Object.keys(request.questions)).toHaveLength(2);
+    expect(Object.keys(request.questions).every((qname) => qname.includes('112'))).toBe(true);
     expect(result.badges).toEqual([
       { id: '111', text: 'SKIP price', tone: 'skip' },
       { id: '113', text: 'SKIP currency', tone: 'skip' },
@@ -1158,7 +1167,7 @@ describe('marketplace session score cache (#4)', () => {
     for (const request of gateway.requests.slice(2)) {
       expect(request.state.note).toBe('must be red');
       expect(request.state.listings.map((listing) => listing.id)).not.toContain('600');
-      expect(request.questions.every((question) => !question.name.includes('600'))).toBe(true);
+      expect(Object.keys(request.questions).every((qname) => !qname.includes('600'))).toBe(true);
     }
     expect(gateway.requests[2]!.state.listings).toHaveLength(12);
     expect(gateway.requests[3]!.state.listings).toHaveLength(1);
@@ -1237,9 +1246,9 @@ describe('marketplace session opened listings (#5)', () => {
         ? { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 }
         : { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 };
       const answers: Record<string, AnswerValue> = {};
-      for (const question of request.questions) {
-        answers[question.name] =
-          question.kind === 'score'
+      for (const [qname, question] of Object.entries(request.questions)) {
+        answers[qname] =
+          question.type === 'score'
             ? { kind: 'score', value: scripted.fit, confidence: scripted.confidence }
             : { kind: 'noul', probabilityTrue: scripted.dealbreaker };
       }
@@ -1281,8 +1290,8 @@ describe('marketplace session opened listings (#5)', () => {
         description,
       },
     ]);
-    expect(request.questions).toHaveLength(2);
-    expect(request.questions.every((question) => question.name.includes('501'))).toBe(true);
+    expect(Object.keys(request.questions)).toHaveLength(2);
+    expect(Object.keys(request.questions).every((qname) => qname.includes('501'))).toBe(true);
 
     // The described verdict replaces the grid badge on the tile and panel.
     expect(opened.badges).toEqual([{ id: '501', text: 'REVIEW 1.5', tone: 'review' }]);
@@ -1395,7 +1404,7 @@ describe('marketplace session opened listings (#5)', () => {
     expect(gateway.requests).toHaveLength(2);
     const [gridChunk, openedSingle] = gateway.requests as [DecisionRequest, DecisionRequest];
     expect(gridChunk.state.listings.map((listing) => listing.id)).toEqual(['701', '702']);
-    expect(gridChunk.questions).toHaveLength(4);
+    expect(Object.keys(gridChunk.questions)).toHaveLength(4);
     expect(openedSingle.state.listings).toEqual([
       {
         id: '703',
@@ -1406,7 +1415,7 @@ describe('marketplace session opened listings (#5)', () => {
         description: 'Seller notes a small scratch.',
       },
     ]);
-    expect(openedSingle.questions).toHaveLength(2);
+    expect(Object.keys(openedSingle.questions)).toHaveLength(2);
     expect(result.badges).toHaveLength(3);
     expect(result.unpainted).toEqual([]);
   });
@@ -1454,7 +1463,7 @@ describe('marketplace session rescore (#6)', () => {
     const request = gateway.requests[1]!;
     expect(request.model).toBe('jev-1.13');
     expect(request.state.listings.map((listing) => listing.id)).toEqual(['801', '802']);
-    expect(request.questions).toHaveLength(4);
+    expect(Object.keys(request.questions)).toHaveLength(4);
     expect(rescored.badges).toEqual([
       { id: '801', text: 'REVIEW 1.5', tone: 'review' },
       { id: '802', text: 'SKIP 0.4', tone: 'skip' },
@@ -1475,9 +1484,9 @@ describe('marketplace session rescore (#6)', () => {
         ? { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 }
         : { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 };
       const answers: Record<string, AnswerValue> = {};
-      for (const question of request.questions) {
-        answers[question.name] =
-          question.kind === 'score'
+      for (const [qname, question] of Object.entries(request.questions)) {
+        answers[qname] =
+          question.type === 'score'
             ? { kind: 'score', value: scripted.fit, confidence: scripted.confidence }
             : { kind: 'noul', probabilityTrue: scripted.dealbreaker };
       }
@@ -1508,8 +1517,8 @@ describe('marketplace session rescore (#6)', () => {
         description,
       },
     ]);
-    expect(request.questions).toHaveLength(2);
-    expect(request.questions.every((question) => question.name.includes('811'))).toBe(true);
+    expect(Object.keys(request.questions)).toHaveLength(2);
+    expect(Object.keys(request.questions).every((qname) => qname.includes('811'))).toBe(true);
     expect(rescored.badges).toEqual([{ id: '811', text: 'REVIEW 1.5', tone: 'review' }]);
     expect(rescored.unpainted).toEqual([]);
     expect(rescored.panel.entries).toEqual([
@@ -1550,7 +1559,7 @@ describe('marketplace session rescore (#6)', () => {
       DecisionRequest,
     ];
     expect(gridChunk.state.listings.map((listing) => listing.id)).toEqual(['821']);
-    expect(gridChunk.questions).toHaveLength(2);
+    expect(Object.keys(gridChunk.questions)).toHaveLength(2);
     expect(openedSingle.state.listings).toEqual([
       {
         id: '822',
@@ -1561,7 +1570,7 @@ describe('marketplace session rescore (#6)', () => {
         description: 'Small scratch on base.',
       },
     ]);
-    expect(openedSingle.questions).toHaveLength(2);
+    expect(Object.keys(openedSingle.questions)).toHaveLength(2);
     expect(rescored.badges).toHaveLength(2);
     expect(rescored.unpainted).toEqual([]);
   });
@@ -1584,9 +1593,9 @@ describe('marketplace session rescore (#6)', () => {
     const [third, fourth] = gateway.requests.slice(2) as [DecisionRequest, DecisionRequest];
     expect(third.model).toBe('jev-1.13');
     expect(third.state.listings.map((listing) => listing.id)).toEqual(ids.slice(0, 12));
-    expect(third.questions).toHaveLength(24);
+    expect(Object.keys(third.questions)).toHaveLength(24);
     expect(fourth.state.listings.map((listing) => listing.id)).toEqual(ids.slice(12));
-    expect(fourth.questions).toHaveLength(2);
+    expect(Object.keys(fourth.questions)).toHaveLength(2);
     expect(rescored.badges).toHaveLength(13);
     expect(rescored.unpainted).toEqual([]);
     expect(rescored.panel.kept).toBe(13);
@@ -1615,8 +1624,8 @@ describe('marketplace session rescore (#6)', () => {
     expect(gateway.requests).toHaveLength(2);
     const request = gateway.requests[1]!;
     expect(request.state.listings.map((listing) => listing.id)).toEqual(['841']);
-    expect(request.questions).toHaveLength(2);
-    expect(request.questions.every((question) => !question.name.includes('842'))).toBe(true);
+    expect(Object.keys(request.questions)).toHaveLength(2);
+    expect(Object.keys(request.questions).every((qname) => !qname.includes('842'))).toBe(true);
     expect(rescored.badges).toEqual([
       { id: '842', text: 'SKIP price', tone: 'skip' },
       { id: '841', text: 'MATCH 2.6', tone: 'match' },
@@ -1711,9 +1720,9 @@ describe('marketplace session rescore (#6)', () => {
         ? { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 }
         : { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 };
       const answers: Record<string, AnswerValue> = {};
-      for (const question of request.questions) {
-        answers[question.name] =
-          question.kind === 'score'
+      for (const [qname, question] of Object.entries(request.questions)) {
+        answers[qname] =
+          question.type === 'score'
             ? { kind: 'score', value: scripted.fit, confidence: scripted.confidence }
             : { kind: 'noul', probabilityTrue: scripted.dealbreaker };
       }
@@ -1913,9 +1922,9 @@ describe('marketplace session CSV export (#7)', () => {
         ? { fit: 1.5, confidence: 0.9, dealbreaker: 0.1 }
         : { fit: 2.6, confidence: 0.8, dealbreaker: 0.1 };
       const answers: Record<string, AnswerValue> = {};
-      for (const question of request.questions) {
-        answers[question.name] =
-          question.kind === 'score'
+      for (const [qname, question] of Object.entries(request.questions)) {
+        answers[qname] =
+          question.type === 'score'
             ? { kind: 'score', value: scripted.fit, confidence: scripted.confidence }
             : { kind: 'noul', probabilityTrue: scripted.dealbreaker };
       }

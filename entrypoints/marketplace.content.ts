@@ -1,10 +1,7 @@
 import { browser } from 'wxt/browser';
 import { MarketplaceSession, briefHashFor, itemId } from '../src/session/marketplace';
-import type {
-  Badge,
-  BadgeTone,
-  TileSnapshot,
-} from '../src/session/marketplace';
+import type { Badge, TileSnapshot } from '../src/session/marketplace';
+import { clearBadge, paintBadge } from '../src/dom/marketplace-badges';
 import { createOpenRouterGateway } from '../src/gateway/openrouter';
 import { briefStore } from '../src/stores/brief';
 import type { BriefState } from '../src/stores/brief';
@@ -185,15 +182,12 @@ export default defineContentScript({
       }
     }
 
-    // Drops every painted badge for a brief-edit rescore: the badge
-    // elements leave the DOM and the tiles become wave candidates again.
+    // Drops every painted badge for a brief-edit rescore: the badge and
+    // tint elements leave the DOM and the tiles become wave candidates again.
     function clearBadges(): void {
       for (const anchor of tileAnchors()) {
         if (anchor.dataset['dealHunterBadge'] === undefined) continue;
-        anchor
-          .querySelectorAll(':scope > span[data-deal-hunter-badge-el]')
-          .forEach((element) => element.remove());
-        delete anchor.dataset['dealHunterBadge'];
+        clearBadge(anchor);
       }
       badges.clear();
     }
@@ -222,38 +216,4 @@ function accessibleName(anchor: HTMLAnchorElement): string {
   return label.replace(/\s+/g, ' ').trim();
 }
 
-const TONE_STYLE: Record<BadgeTone, { background: string; color: string }> = {
-  match: { background: '#137333', color: '#ffffff' },
-  skip: { background: 'rgba(179, 38, 30, 0.82)', color: '#ffffff' },
-  review: { background: '#5f6368', color: '#ffffff' },
-};
 
-function paintBadge(anchor: HTMLAnchorElement, badge: Badge): void {
-  anchor.dataset['dealHunterBadge'] = badge.id;
-  if (window.getComputedStyle(anchor).position === 'static') {
-    anchor.style.position = 'relative';
-  }
-  const tone = TONE_STYLE[badge.tone];
-  const element = document.createElement('span');
-  element.textContent = badge.text;
-  element.dataset['dealHunterBadgeEl'] = badge.id;
-  element.setAttribute('aria-hidden', 'true');
-  element.style.position = 'absolute';
-  element.style.top = '8px';
-  element.style.left = '8px';
-  element.style.zIndex = '1000';
-  element.style.pointerEvents = 'none';
-  element.style.background = tone.background;
-  element.style.color = tone.color;
-  element.style.font =
-    '600 11px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif';
-  element.style.letterSpacing = '0.02em';
-  element.style.padding = '2px 8px';
-  element.style.borderRadius = '999px';
-  element.style.whiteSpace = 'nowrap';
-  element.style.boxShadow = '0 1px 3px rgba(0, 0, 0, 0.4)';
-  anchor.appendChild(element);
-  if (!window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
-    void element.animate([{ opacity: 0 }, { opacity: 1 }], { duration: 180 });
-  }
-}
