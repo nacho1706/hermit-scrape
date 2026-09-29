@@ -1,5 +1,9 @@
 import { describe, expect, it } from 'vitest';
-import { MarketplaceSession } from '../src/session/marketplace';
+import {
+  MarketplaceSession,
+  parseMaxPriceInput,
+  parsePlacesInput,
+} from '../src/session/marketplace';
 import type {
   AnswerValue,
   Brief,
@@ -701,21 +705,25 @@ describe('marketplace session hard limits (#3)', () => {
     expect(result.badges).toEqual([{ id: '74', text: 'SKIP currency', tone: 'skip' }]);
   });
 
-  it('rejects any other recognized currency with no exchange rate', async () => {
+  it('sends another recognized currency when no max price is set', async () => {
+    // Currency is the unit of the max-price cap, not a standalone filter:
+    // with no cap there is nothing to compare, so the listing is sent.
     for (const [currency, name] of [
       ['ARS', 'Bike, € 100, Palermo'],
       ['USD', 'Bike, R$ 100, Palermo'],
       ['ARS', 'Bike, 100 EUR, Palermo'],
     ] as const) {
-      const gateway = new ScriptedGateway(() => ok());
+      const gateway = new ScriptedGateway(
+        answersFor({ '81': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+      );
       const session = new MarketplaceSession(gateway);
       const result = await session.judgeWave(
         { query: 'bike', currency },
         [tile('81', name)],
         true,
       );
-      expect(gateway.requests).toHaveLength(0);
-      expect(result.badges).toEqual([{ id: '81', text: 'SKIP currency', tone: 'skip' }]);
+      expect(gateway.requests).toHaveLength(1);
+      expect(result.badges).toEqual([{ id: '81', text: 'MATCH 2.5', tone: 'match' }]);
     }
   });
 
@@ -1966,5 +1974,219 @@ describe('marketplace session CSV export (#7)', () => {
     expect(lines).toHaveLength(2);
     // The title carries a comma and quotes, so it is quoted with doubled quotes.
     expect(lines[1]).toContain('"Bike, mountain ""trail"""');
+  });
+});
+
+describe('marketplace session filter improvements', () => {
+  const tile = (id: string, name: string) => ({
+    href: `https://www.facebook.com/marketplace/item/${id}/`,
+    name,
+  });
+
+  it('matches a place in a label with no comma-separated place segment', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '911': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'iPhone', places: ['Palermo'] },
+      [tile('911', 'iPhone 13 128GB $ 250.000 Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(result.badges).toEqual([{ id: '911', text: 'MATCH 2.5', tone: 'match' }]);
+  });
+
+  it('matches a place that is not the last label segment', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '912': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'iPhone', places: ['palermo'] },
+      [tile('912', 'iPhone 13 128GB, $ 250.000, Palermo, Buenos Aires')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(result.badges).toEqual([{ id: '912', text: 'MATCH 2.5', tone: 'match' }]);
+  });
+
+  it('still skips when the wanted place appears nowhere in the label', async () => {
+    const gateway = new ScriptedGateway(() => ok());
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'iPhone', places: ['Palermo'] },
+      [tile('913', 'iPhone 13 128GB $ 250.000 Recoleta')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(0);
+    expect(result.badges).toEqual([{ id: '913', text: 'SKIP location', tone: 'skip' }]);
+  });
+
+  it('matches places ignoring accents on either side', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '914': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'bike', places: ['cordoba'] },
+      [tile('914', 'Bike, $ 100, Córdoba')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(result.badges).toEqual([{ id: '914', text: 'MATCH 2.5', tone: 'match' }]);
+
+    const accented = new ScriptedGateway(
+      answersFor({ '915': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const accentedSession = new MarketplaceSession(accented);
+    const second = await accentedSession.judgeWave(
+      { query: 'bike', places: ['Córdoba'] },
+      [tile('915', 'Bike, $ 100, Cordoba')],
+      true,
+    );
+    expect(accented.requests).toHaveLength(1);
+    expect(second.badges).toEqual([{ id: '915', text: 'MATCH 2.5', tone: 'match' }]);
+  });
+
+  it('ignores a currency mismatch when no max price is set', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '916': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'bike', currency: 'ARS' },
+      [tile('916', 'Bike, US$ 200, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.state.listings[0]).toMatchObject({
+      price: 200,
+      currency: 'USD',
+    });
+    expect(result.badges).toEqual([{ id: '916', text: 'MATCH 2.5', tone: 'match' }]);
+  });
+
+  it('still skips a currency mismatch once a max price is set', async () => {
+    const gateway = new ScriptedGateway(() => ok());
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'bike', maxPrice: 300000, currency: 'ARS' },
+      [tile('917', 'Bike, US$ 200, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(0);
+    expect(result.badges).toEqual([{ id: '917', text: 'SKIP currency', tone: 'skip' }]);
+  });
+
+  it('reads a price with the symbol after the amount', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '918': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'bike', maxPrice: 300000, currency: 'ARS' },
+      [tile('918', 'Bike, 250.000 $, Palermo')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.state.listings[0]).toMatchObject({
+      price: 250000,
+      currency: 'ARS',
+    });
+    expect(result.badges).toEqual([{ id: '918', text: 'MATCH 2.5', tone: 'match' }]);
+
+    const usdGateway = new ScriptedGateway(() => ok());
+    const usdSession = new MarketplaceSession(usdGateway);
+    const usd = await usdSession.judgeWave(
+      { query: 'bike', maxPrice: 300000, currency: 'ARS' },
+      [tile('919', 'Bike, 200 US$, Palermo')],
+      true,
+    );
+    expect(usdGateway.requests).toHaveLength(0);
+    expect(usd.badges).toEqual([{ id: '919', text: 'SKIP currency', tone: 'skip' }]);
+  });
+
+  it('reads a tolerant max price from the side-panel input', () => {
+    expect(parseMaxPriceInput('')).toBeNull();
+    expect(parseMaxPriceInput('   ')).toBeNull();
+    expect(parseMaxPriceInput('250.000')).toBe(250000);
+    expect(parseMaxPriceInput('$ 250.000')).toBe(250000);
+    expect(parseMaxPriceInput('250.000 $')).toBe(250000);
+    expect(parseMaxPriceInput('USD 200')).toBe(200);
+    expect(parseMaxPriceInput('200 ARS')).toBe(200);
+    expect(parseMaxPriceInput('250k')).toBe(250000);
+    expect(parseMaxPriceInput('250 mil')).toBe(250000);
+    expect(parseMaxPriceInput('1.5M')).toBe(1500000);
+    expect(parseMaxPriceInput('2 millones')).toBe(2000000);
+    expect(parseMaxPriceInput('abc')).toBeNull();
+    expect(parseMaxPriceInput('$')).toBeNull();
+    expect(parseMaxPriceInput('20k5')).toBeNull();
+  });
+
+  it('splits the places input on semicolons so commas stay literal', () => {
+    expect(parsePlacesInput('')).toEqual([]);
+    expect(parsePlacesInput('Yerba Buena, TM')).toEqual(['Yerba Buena, TM']);
+    expect(parsePlacesInput('Yerba Buena, TM; Lules, TM')).toEqual([
+      'Yerba Buena, TM',
+      'Lules, TM',
+    ]);
+    expect(parsePlacesInput('Palermo;Belgrano;')).toEqual(['Palermo', 'Belgrano']);
+  });
+
+  it('filters the City, Province input to Yerba Buena tiles only', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '921': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'iPhone', places: parsePlacesInput('Yerba Buena, TM') },
+      [
+        tile('921', 'Vendo iPhone 15, $480, Yerba Buena, TM, Listed 3 days ago'),
+        tile('922', 'iPhone 13, Lules, TM, Listed 2 days ago'),
+      ],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.state.listings.map((listing) => listing.id)).toEqual(['921']);
+    expect(result.badges).toEqual([
+      { id: '922', text: 'SKIP location', tone: 'skip' },
+      { id: '921', text: 'MATCH 2.5', tone: 'match' },
+    ]);
+  });
+
+  it('matches when the label glues the comma with no space', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '923': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'iPhone', places: parsePlacesInput('Yerba Buena, TM') },
+      [tile('923', 'Vendo iPhone 15, $480, Yerba Buena,TM, Listed 3 days ago')],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(result.badges).toEqual([{ id: '923', text: 'MATCH 2.5', tone: 'match' }]);
+  });
+
+  it('matches when the label separates with dots instead of commas', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '924': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'iPhone', places: parsePlacesInput('Yerba Buena, TM') },
+      [
+        tile('924', 'Vendo iPhone 15 · $480 · Yerba Buena · TM'),
+        tile('925', 'iPhone 13 · Lules · TM'),
+      ],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.state.listings.map((listing) => listing.id)).toEqual(['924']);
+    expect(result.badges).toEqual([
+      { id: '925', text: 'SKIP location', tone: 'skip' },
+      { id: '924', text: 'MATCH 2.5', tone: 'match' },
+    ]);
   });
 });

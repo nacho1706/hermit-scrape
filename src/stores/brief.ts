@@ -1,7 +1,8 @@
 import { storage } from 'wxt/utils/storage';
 
 // The shopper's brief. Max price is null when the shopper sets no cap;
-// currency defaults to ARS; places are case-insensitive substrings; note is
+// currency defaults to ARS; places are case- and accent-insensitive
+// substrings, split on semicolons at input so commas stay literal; note is
 // empty when the shopper left it empty. Stored locally: it stays on this
 // machine. Older stored briefs may lack the newer fields; the session
 // normalizes missing values to these defaults.

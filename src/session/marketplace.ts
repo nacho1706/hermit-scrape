@@ -187,6 +187,22 @@ interface ParsedTile {
   price: number | null;
   currency: string | null;
   place: string;
+  // The label with price spans removed, before title/place segmentation.
+  // Location matching reads this, not the place segment alone, because real
+  // labels vary in shape and segment order.
+  text: string;
+}
+
+// Folds a place string for comparison: accents dropped, lowercase, and every
+// run of separators (commas, dots, stray spacing) collapsed to one space, so
+// `Yerba Buena, TM`, `Yerba Buena,TM`, and `Yerba Buena · TM` all agree.
+function normalizePlaceText(value: string): string {
+  return value
+    .normalize('NFD')
+    .replace(/\p{M}/gu, '')
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}]+/gu, ' ')
+    .trim();
 }
 
 const FREE_PATTERN = /\b(free|gratis)\b/i;
@@ -209,7 +225,7 @@ function canonicalCurrency(marker: string, briefCurrency: BriefCurrency): string
 
 // Thousand separators read as one integer (`250.000` is 250000); a trailing
 // separator with one or two digits is a decimal (`1.234,56` is 1234.56).
-// Exported for the side panel's max-price input, which reads the same way.
+// Shared with the side panel's max-price input through parseMaxPriceInput.
 export function parseAmount(raw: string): number {
   const compact = raw.replace(/\s+/g, '').replace(/[.,]+$/, '');
   const trailing = /[.,](\d{1,2})$/.exec(compact);
@@ -218,6 +234,53 @@ export function parseAmount(raw: string): number {
     return parseFloat(`${head.replace(/[.,]/g, '')}.${trailing[1]}`);
   }
   return parseInt(compact.replace(/[.,]/g, ''), 10);
+}
+
+// Reads the side panel's max-price input the way tiles read: thousand
+// separators as one integer, a trailing short separator as a decimal. One
+// leading or trailing currency marker is ignored (`$ 250.000`, `USD 200`,
+// `200 ARS`), and a trailing `k`, `m`, `mil`, or `millon` multiplies by a
+// thousand or a million. Anything else with letters is not a price.
+export function parseMaxPriceInput(value: string): number | null {
+  let text = value.trim().replace(/\s+/g, ' ');
+  if (text === '') return null;
+  text = text
+    .replace(/^(?:US\$|U\$S|R\$|MX\$|\$|€|£)\s*/i, '')
+    .replace(/\s*(?:US\$|U\$S|R\$|MX\$|\$|€|£)$/i, '')
+    .replace(/^(?:USD|ARS|EUR|GBP|BRL|CLP|COP|MXN|PEN|UYU|PYG|BOB|CAD|AUD|CHF|Bs)\s+/i, '')
+    .replace(/\s+(?:USD|ARS|EUR|GBP|BRL|CLP|COP|MXN|PEN|UYU|PYG|BOB|CAD|AUD|CHF|Bs)$/i, '')
+    .trim();
+  if (text === '') return null;
+  let multiplier = 1;
+  const suffix = /([\p{L}]+)\.?$/u.exec(text);
+  if (suffix !== null) {
+    const word = (suffix[1] ?? '')
+      .normalize('NFD')
+      .replace(/\p{M}/gu, '')
+      .toLowerCase();
+    if (word === 'k' || word === 'mil') {
+      multiplier = 1000;
+    } else if (word === 'm' || word === 'millon' || word === 'millones') {
+      multiplier = 1000000;
+    } else {
+      return null;
+    }
+    text = text.slice(0, text.length - suffix[0].length).trim();
+  }
+  if (!/^\d[\d.,\s]*$/.test(text)) return null;
+  const amount = parseAmount(text) * multiplier;
+  return Number.isFinite(amount) && amount >= 0 ? amount : null;
+}
+
+// Splits the side panel's places input into wanted places. Entries split on
+// semicolons so a comma stays part of the place, the way listings print it
+// (`Yerba Buena, TM; Lules, TM`). Matching stays a case- and
+// accent-insensitive substring OR across entries.
+export function parsePlacesInput(value: string): string[] {
+  return value
+    .split(';')
+    .map((place) => place.trim())
+    .filter((place) => place !== '');
 }
 
 interface PriceCandidate {
@@ -249,6 +312,24 @@ function scanExplicitPrices(
       currency: canonicalCurrency(marker, briefCurrency),
       start,
       end: start + match[0].length,
+    });
+  }
+  // Symbol suffix: `250.000 $`, `200 US$`.
+  const suffixPattern = new RegExp(
+    `(${amount})\\s*(${SYMBOL_PREFIX_PATTERN.source})(?!\\d)`,
+    'gi',
+  );
+  for (const match of name.matchAll(suffixPattern)) {
+    const marker = match[2] ?? '';
+    const raw = match[1] ?? '';
+    const start = match.index ?? 0;
+    const end = start + match[0].length;
+    if (candidates.some((c) => start < c.end && end > c.start)) continue;
+    candidates.push({
+      amount: parseAmount(raw),
+      currency: canonicalCurrency(marker, briefCurrency),
+      start,
+      end,
     });
   }
   // Letter code before or after the amount: `USD 200`, `200 ARS`.
@@ -337,19 +418,21 @@ function parseTile(name: string, briefCurrency: BriefCurrency): ParsedTile {
   }
 
   working = working.replace(LISTING_ID_SUFFIX_PATTERN, '');
+  const text = working;
   const segments = working
     .split(',')
     .map((segment) => segment.replace(/\s+/g, ' ').trim())
     .filter((segment) => segment !== '');
-  if (segments.length === 0) return { title: '', price, currency, place: '' };
+  if (segments.length === 0) return { title: '', price, currency, place: '', text };
   if (segments.length === 1) {
-    return { title: segments[0]!, price, currency, place: '' };
+    return { title: segments[0]!, price, currency, place: '', text };
   }
   return {
     title: segments.slice(0, -1).join(', '),
     price,
     currency,
     place: segments[segments.length - 1]!,
+    text,
   };
 }
 
@@ -357,9 +440,13 @@ function localReasonFor(
   parsed: ParsedTile,
   brief: NormalizedBrief,
 ): LocalReason | null {
-  // Currency first: without a shared unit there is no meaningful cap check,
-  // and there is no exchange rate.
-  if (parsed.currency !== null && parsed.currency !== brief.currency) {
+  // Currency is the unit of the max-price cap, not a standalone filter: with
+  // no cap there is nothing to compare, and there is no exchange rate.
+  if (
+    brief.maxPrice !== null &&
+    parsed.currency !== null &&
+    parsed.currency !== brief.currency
+  ) {
     return 'currency';
   }
   if (parsed.price === null) {
@@ -367,12 +454,16 @@ function localReasonFor(
   } else if (brief.maxPrice !== null && parsed.price > brief.maxPrice) {
     return 'price';
   }
-  const wanted = brief.places.map((place) => place.trim()).filter((p) => p !== '');
+  const wanted = brief.places
+    .map((place) => normalizePlaceText(place))
+    .filter((place) => place !== '');
   if (wanted.length > 0) {
-    const place = parsed.place.toLowerCase();
-    const hit =
-      place !== '' &&
-      wanted.some((sub) => place.includes(sub.toLowerCase()));
+    // Labels vary in shape and segment order, so a wanted place matches
+    // anywhere in the price-stripped label, not only the last segment. A
+    // title that names a place can match too; letting one through beats
+    // skipping the whole grid when the label has no place segment.
+    const haystack = normalizePlaceText(parsed.text);
+    const hit = wanted.some((sub) => haystack.includes(sub));
     if (!hit) return 'location';
   }
   return null;
