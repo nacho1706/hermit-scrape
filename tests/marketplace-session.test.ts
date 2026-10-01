@@ -2198,4 +2198,25 @@ describe('marketplace session filter improvements', () => {
       { id: '924', text: 'MATCH 2.5', tone: 'match' },
     ]);
   });
+
+  it('still matches a comma-separated list the way the old input read it', async () => {
+    const gateway = new ScriptedGateway(
+      answersFor({ '926': { fit: 2.5, confidence: 0.9, dealbreaker: 0.0 } }),
+    );
+    const session = new MarketplaceSession(gateway);
+    const result = await session.judgeWave(
+      { query: 'furniture', places: parsePlacesInput('Palermo, Belgrano') },
+      [
+        tile('926', 'Silla de madera, $ 50.000, Palermo'),
+        tile('927', 'Mesa ratona, $ 30.000, Recoleta'),
+      ],
+      true,
+    );
+    expect(gateway.requests).toHaveLength(1);
+    expect(gateway.requests[0]!.state.listings.map((listing) => listing.id)).toEqual(['926']);
+    expect(result.badges).toEqual([
+      { id: '927', text: 'SKIP location', tone: 'skip' },
+      { id: '926', text: 'MATCH 2.5', tone: 'match' },
+    ]);
+  });
 });
