@@ -204,6 +204,23 @@ function normalizePlaceText(value: string): string {
     .trim();
 }
 
+// One places entry yields its whole normalized text plus, as a fallback for
+// comma-separated lists (`Palermo, Belgrano`), each substantial comma-part.
+// Short parts never stand alone: region codes such as TM are shared across
+// places, so matching on them would pass Lules for a `Yerba Buena, TM`
+// filter. Whole entries keep exact substring semantics either way.
+function placeAlternatives(entry: string): string[] {
+  const full = normalizePlaceText(entry);
+  const parts = entry
+    .split(',')
+    .map((part) => normalizePlaceText(part))
+    .filter(
+      (part) =>
+        part !== '' && part !== full && part.replace(/ /g, '').length >= 3,
+    );
+  return [full, ...parts];
+}
+
 const FREE_PATTERN = /\b(free|gratis)\b/i;
 
 // Symbol prefixes before the amount. Longer markers come first so `US$`
@@ -454,7 +471,7 @@ function localReasonFor(
     return 'price';
   }
   const wanted = brief.places
-    .map((place) => normalizePlaceText(place))
+    .flatMap((place) => placeAlternatives(place))
     .filter((place) => place !== '');
   if (wanted.length > 0) {
     // Labels vary in shape and segment order, so a wanted place matches
