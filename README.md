@@ -1,65 +1,67 @@
-# Deal Hunter
+# Marketplace Listing Assistant
 
-Deal Hunter es una extensión de navegador para ayudar a revisar publicaciones de Facebook Marketplace según lo que buscas. Analiza las tarjetas visibles en una grilla, les asigna una etiqueta (`MATCH`, `SKIP` o `REVIEW`) y muestra un resumen en el panel lateral. También permite exportar los resultados de la sesión a CSV.
+A browser extension that helps people evaluate marketplace listings against what they are looking for. It reads visible listing cards, compares them with a search brief, and labels each result `MATCH`, `SKIP`, or `REVIEW`. A side panel shows the results and session summary, with an option to export the session as CSV.
 
-La extensión está construida con [WXT](https://wxt.dev/) y TypeScript. Para evaluar publicaciones usa Jev (`jev-1.13`) a través de OpenRouter y requiere tu propia API key; los cargos de esas consultas se hacen a tu cuenta de OpenRouter.
+The project is intended to grow into a marketplace-independent tool, with support for sites such as Facebook Marketplace, Mercado Libre, Alibaba, and others. At present, the implemented listing integration is Facebook Marketplace. Support for Mercado Libre, Alibaba, and additional marketplaces is a future direction, not a current feature.
 
-## Cómo funciona
+The extension is built with [WXT](https://wxt.dev/) and TypeScript. It evaluates listings through Jev (`jev-1.13`) using your own OpenRouter API key. Requests may incur charges on your OpenRouter account.
 
-1. En una página de grilla de Facebook Marketplace, la extensión observa las tarjetas de publicaciones que aparecen en pantalla. No hace clic, no desplaza la página ni escribe por ti.
-2. Al abrir Deal Hunter desde la barra del navegador, el panel lateral permite definir la búsqueda.
-3. El nombre o consulta y las publicaciones visibles se envían a Jev para estimar qué tan bien coincide cada artículo y detectar motivos concretos para descartarlo.
-4. La extensión pinta la tarjeta con `MATCH`, `SKIP` o `REVIEW`, y actualiza conteos, tiempos y costo estimado en el panel. Las publicaciones que no tengan precio legible pueden quedar sujetas a los filtros locales de precio.
-5. Los resultados se pueden descargar como `deal-hunter-session.csv`.
+## How it works
 
-Las publicaciones nuevas se procesan en grupos pequeños. Los resultados se conservan durante la sesión del navegador para no volver a puntuar innecesariamente; al cambiar la búsqueda se recalculan para el nuevo criterio.
+1. On a Facebook Marketplace listing grid, the extension watches the listing cards that appear on the page. It reads the page and adds visual labels; it does not click, scroll, or type on your behalf.
+2. Open the extension's side panel and describe what you are looking for.
+3. The search brief and visible listing details are sent to Jev, which estimates how well each listing matches and whether it contains a concrete reason to reject it.
+4. The extension marks listings `MATCH`, `SKIP`, or `REVIEW` and updates the counts, response time, and reported cost in the panel. Local price and location filters can also reject listings when their details are readable.
+5. Export the current session's results as a CSV file.
 
-## Requisitos
+Newly appearing listings are processed in small batches. Judgments are cached for the browser session to avoid scoring the same listing repeatedly. Editing the search brief starts evaluation for the updated criteria.
 
-- Node.js y npm.
-- Un navegador Chromium con soporte para extensiones Manifest V3 y panel lateral.
-- Una cuenta y una API key de OpenRouter con acceso al endpoint Jev.
+## Requirements
 
-## Instalación para desarrollo
+- Node.js and npm.
+- A Chromium-based browser with support for Manifest V3 extensions and the side panel API.
+- An OpenRouter account and API key with access to the Jev endpoint.
+
+## Development setup
 
 ```sh
-git clone <URL-del-repositorio>
+git clone <repository-url>
 cd hermit
 npm install
 npm run dev
 ```
 
-WXT inicia el modo de desarrollo y muestra cómo cargar la extensión en el navegador. Para generar la versión empaquetada:
+WXT starts the development workflow and shows how to load the extension in a browser. To build the extension:
 
 ```sh
 npm run build
 ```
 
-El resultado se genera en `.output/` (por defecto, para Chromium). En Chrome o Edge se puede cargar la carpeta de extensión generada desde la página de gestión de extensiones, con el modo de desarrollador habilitado.
+The build output is generated in `.output/` for Chromium by default. In Chrome or Edge, enable developer mode on the extensions page and load the generated extension directory.
 
-## Configuración y uso
+## Configuration and use
 
-1. Instala o carga la extensión y abre su página de opciones.
-2. Guarda tu clave de OpenRouter en el campo **OpenRouter key**. La clave se guarda en el almacenamiento local de la extensión, no se muestra de nuevo y se envía al servicio solo en el encabezado de autorización de las consultas.
-3. Abre una grilla de Facebook Marketplace y el panel lateral de Deal Hunter.
-4. Completa los campos disponibles:
-   - **Query**: nombre o descripción breve del producto que buscas. Es necesario para iniciar la evaluación.
-   - **Precio máximo** y **moneda**: límite opcional; la moneda predeterminada es ARS. Sin precio máximo no se aplica ese filtro.
-   - **Ubicación**: una o más ubicaciones, separadas por punto y coma.
-   - **Nota**: requisitos adicionales para evaluar la publicación.
-5. Revisa las etiquetas y el resumen. Usa **Export CSV** para descargar los resultados de la sesión.
+1. Install or load the extension, then open its options page.
+2. Save your OpenRouter API key in the **OpenRouter key** field. The key is stored in the browser's local extension storage, is not shown again, and is sent to the service only in the request's authorization header.
+3. Open a Facebook Marketplace listing grid and open the extension's side panel.
+4. Fill in the search brief:
+   - **Query**: the product name or a short description. This is required to start evaluation.
+   - **Maximum price** and **currency**: an optional price limit. The default currency is ARS. The price filter is inactive when no maximum is set.
+   - **Location**: one or more locations, separated by semicolons.
+   - **Note**: additional requirements for evaluating a listing.
+5. Review the labels and summary. Select **Export CSV** to download the session results.
 
-La consulta, los criterios y la clave se guardan localmente en el navegador. El análisis de publicaciones requiere conexión a Internet y usa tu cuenta de OpenRouter.
+The search brief and API key are stored locally in the browser. Listing evaluation requires an internet connection and uses your OpenRouter account.
 
-## Estado de las pruebas manuales
+## Manual verification status
 
-Se probaron los campos **Query** (nombre del producto) y **Ubicación**. Todavía no se probaron **Precio**, **Moneda** ni el **tipo de moneda**. Por lo tanto, esos campos están disponibles en la interfaz, pero su comportamiento no está validado manualmente.
+The **Query** field (product name) and **Location** field have been manually tried. **Price**, **Currency**, and **Currency type** have not been manually tested. These fields are present in the interface, but their behavior has not yet been verified manually.
 
-## Comandos disponibles
+## Available commands
 
-| Comando | Descripción |
+| Command | Description |
 | --- | --- |
-| `npm run dev` | Inicia WXT en modo desarrollo. |
-| `npm run build` | Compila la extensión. |
-| `npm run test` | Ejecuta las pruebas automatizadas existentes. |
-| `npm run typecheck` | Comprueba los tipos de TypeScript. |
+| `npm run dev` | Start WXT in development mode. |
+| `npm run build` | Build the extension. |
+| `npm run test` | Run the existing automated tests. |
+| `npm run typecheck` | Check TypeScript types. |
